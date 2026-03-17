@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import sys
+from pathlib import Path
 
 import numpy as np
+
+# Allow `python simulation/main.py` from the repo root or an IDE run config.
+if __package__ in (None, ""):
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
 
 from dynamics_wrapper import step as dynamics_step
 from dynamics_wrapper.params import load_body_params, load_fin_params
@@ -19,7 +27,7 @@ from simulation.local_planning.sensor import get_visible_obstacles
 @dataclass
 class HybridSimulationConfig:
     dt: float = 0.2
-    max_steps: int = 100
+    max_steps: int = 1000
     goal_threshold: float = 1.0
     local_lookahead: float = 4.0
 
@@ -66,7 +74,7 @@ def run_hybrid_los_rl_simulation(model_path=None, visualize: bool = False) -> di
         _make_obstacle([5.0, 5.0, 0.0], 1.6),
         _make_obstacle([12.0, 13.0, 1.0], 1.5),
     ]
-    dyn_obs = [_make_obstacle([12.0, 2.0, 0.5], 1.5, [-1.0, 1.2, 0.6])]
+    dyn_obs = [_make_obstacle([12.0, 2.0, 0.5], 1.5, [-0.5, 0.6, 0.3])]
 
     traj_global = planGlobalBezierPSO(fs, fg, opts, static_obs + dyn_obs)
     s_max = traj_global["xyz"].shape[0]

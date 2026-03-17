@@ -1,0 +1,12 @@
+STATE_DIM = 13
+BODY_PARAM_DIM = 36
+FIN_PARAM_DIM = 38
+REF_DIM = 5
+HIST_DIM = 5
+
+VX, VY, VZ = 0, 1, 2
+WX, WY, WZ = 3, 4, 5
+Q0, Q1, Q2, Q3 = 6, 7, 8, 9
+PX, PY, PZ = 10, 11, 12
+
+A1, A2, A3, A4, A5 = 0, 1, 2, 3, 4

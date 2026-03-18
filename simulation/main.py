@@ -104,15 +104,7 @@ def run_hybrid_los_rl_simulation(model_path=None, visualize: bool = False) -> di
     ref_min = np.asarray(env_cfg["ref_min"], dtype=np.float64)
     ref_max = np.asarray(env_cfg["ref_max"], dtype=np.float64)
     fish_params = {
-        "Kp_z": 2.0,
-        "Kd_z": 40.0,
-        "Kp_psi": 1.0,
-        "Kd_psi": 0.5,
-        "A_base": np.deg2rad(45.0),
-        "A_rot_base": np.deg2rad(15.0),
-        "alpha5_min": np.deg2rad(-45.0),
-        "alpha5_max": np.deg2rad(45.0),
-        "delta_rot_max": np.deg2rad(15.0),
+        key: float(value) for key, value in env_cfg["controller_params"].items()
     }
 
     local_planner = RLLocalPlanner(model_path=model_path)
@@ -181,25 +173,16 @@ def run_hybrid_los_rl_simulation(model_path=None, visualize: bool = False) -> di
         if mode == "LOCAL_AVOIDANCE":
             local_target = find_local_target(traj_global, curr_pos, cfg.local_lookahead)
             local_target_log = np.asarray(local_target, dtype=np.float64).copy()
-            lookback = max(1, current_path_idx - 10)
-            _, _, psi_ref, theta_ref = los_guidance_3d(
-                curr_pos, (lookback, s_max), los_params["Delta"], los_params["Delta"], fx, fy, fz
+            action_ref, _, _, cmd_vel_global, ctrl_state = local_planner.plan(
+                fish_state,
+                hist,
+                local_target,
+                visible_obs,
+                ctrl_state,
+                cfg.dt,
+                fish_params,
             )
-            cmd_vel_global = np.array(
-                [
-                    opts["vmax"] * np.cos(theta_ref) * np.cos(psi_ref),
-                    opts["vmax"] * np.cos(theta_ref) * np.sin(psi_ref),
-                    -opts["vmax"] * np.sin(theta_ref),
-                ],
-                dtype=np.float64,
-            )
-            _, _, _, _, alpha5_ref, ctrl_state = fin_controller(
-                cmd_vel_global, fish_state, ctrl_state, cfg.dt, fish_params
-            )
-            action_ref, _, _ = local_planner.plan(
-                fish_state, hist, local_target, visible_obs, alpha5_ref
-            )
-            sa_settings["cmd_vel_des"][:, k - 1] = robot_vel
+            sa_settings["cmd_vel_des"][:, k - 1] = cmd_vel_global
             if np.isfinite(d_min):
                 title_hist.append(f"Step {k}: LOCAL AVOIDANCE (RL) - Visible Dist: {d_min:.2f}")
             else:

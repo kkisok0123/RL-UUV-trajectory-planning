@@ -69,6 +69,36 @@ def _transform_cone(
     return x, y, z
 
 
+def _axis_limits_from_points(
+    points: list[np.ndarray],
+    min_span: float = 6.0,
+    pad_ratio: float = 0.12,
+) -> tuple[np.ndarray, np.ndarray]:
+    valid_points = []
+    for pts in points:
+        pts = np.asarray(pts, dtype=np.float64)
+        if pts.size == 0:
+            continue
+        pts = pts.reshape(-1, 3)
+        mask = np.isfinite(pts).all(axis=1)
+        if np.any(mask):
+            valid_points.append(pts[mask])
+
+    if not valid_points:
+        mins = np.array([-3.0, -3.0, -3.0], dtype=np.float64)
+        maxs = np.array([3.0, 3.0, 3.0], dtype=np.float64)
+        return mins, maxs
+
+    all_points = np.vstack(valid_points)
+    mins = np.min(all_points, axis=0)
+    maxs = np.max(all_points, axis=0)
+    spans = np.maximum(maxs - mins, min_span)
+    pads = np.maximum(spans * pad_ratio, 0.5)
+    centers = 0.5 * (mins + maxs)
+    half_spans = 0.5 * spans + pads
+    return centers - half_spans, centers + half_spans
+
+
 def plot_hybrid_result(result: dict, static_obs: list[dict], dyn_obs: list[dict], goal: np.ndarray) -> None:
     del dyn_obs
 
@@ -114,6 +144,26 @@ def plot_hybrid_result(result: dict, static_obs: list[dict], dyn_obs: list[dict]
     if dyn_obs_radii.ndim != 1:
         dyn_obs_radii = np.zeros((0,), dtype=np.float64)
 
+    bounds_points: list[np.ndarray] = [
+        traj_global,
+        valid_path,
+        np.asarray(goal, dtype=np.float64).reshape(1, 3),
+    ]
+    if static_obs:
+        static_bounds = []
+        for obstacle in static_obs:
+            center = np.asarray(obstacle["c"], dtype=np.float64).reshape(3)
+            radius = float(obstacle["r"])
+            static_bounds.extend([center - radius, center + radius])
+        bounds_points.append(np.asarray(static_bounds, dtype=np.float64))
+    if dyn_obs_hist.size > 0 and dyn_obs_hist.shape[1] > 0:
+        for obs_idx in range(dyn_obs_hist.shape[1]):
+            radius = float(dyn_obs_radii[obs_idx]) if obs_idx < dyn_obs_radii.size else 0.0
+            bounds_points.append(dyn_obs_hist[:, obs_idx, :] - radius)
+            bounds_points.append(dyn_obs_hist[:, obs_idx, :] + radius)
+    axis_mins, axis_maxs = _axis_limits_from_points(bounds_points)
+    axis_spans = np.maximum(axis_maxs - axis_mins, 1.0)
+
     fig = plt.figure(
         figsize=(12, 10),
         facecolor="white",
@@ -123,13 +173,13 @@ def plot_hybrid_result(result: dict, static_obs: list[dict], dyn_obs: list[dict]
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
     ax.set_zlabel("Z (m)")
-    ax.set_xlim(-3.0, 18.0)
-    ax.set_ylim(-3.0, 18.0)
-    ax.set_zlim(-10.0, 10.0)
+    ax.set_xlim(float(axis_mins[0]), float(axis_maxs[0]))
+    ax.set_ylim(float(axis_mins[1]), float(axis_maxs[1]))
+    ax.set_zlim(float(axis_mins[2]), float(axis_maxs[2]))
     ax.view_init(elev=30.0, azim=-37.5)
     ax.grid(True)
     try:
-        ax.set_box_aspect((21.0, 21.0, 20.0))
+        ax.set_box_aspect(tuple(axis_spans))
     except AttributeError:
         pass
 

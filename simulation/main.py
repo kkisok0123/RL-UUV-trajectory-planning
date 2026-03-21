@@ -42,7 +42,55 @@ def _make_obstacle(center, radius, velocity=None) -> dict:
     }
 
 
-def run_hybrid_los_rl_simulation(model_path=None, visualize: bool = False) -> dict:
+def _quat_from_forward_vector(forward_world: np.ndarray) -> np.ndarray:
+    forward_world = np.asarray(forward_world, dtype=np.float64).reshape(3)
+    speed = float(np.linalg.norm(forward_world))
+    if speed < 1e-8:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+
+    yaw = float(np.arctan2(forward_world[1], forward_world[0]))
+    pitch = float(np.arctan2(forward_world[2], np.linalg.norm(forward_world[:2])))
+
+    cy = np.cos(0.5 * yaw)
+    sy = np.sin(0.5 * yaw)
+    cp = np.cos(0.5 * pitch)
+    sp = np.sin(0.5 * pitch)
+    quat = np.array([cp * cy, sp * sy, -sp * cy, cp * sy], dtype=np.float64)
+    return quat / np.linalg.norm(quat)
+
+
+def _compute_tracking_metrics(settings: dict, controller_params: dict, steps_executed: int) -> dict:
+    if steps_executed <= 0:
+        return {}
+
+    theta_err = np.asarray(settings.get("e_theta", np.zeros(steps_executed)), dtype=np.float64)[:steps_executed]
+    psi_err = np.asarray(settings.get("e_psi", np.zeros(steps_executed)), dtype=np.float64)[:steps_executed]
+    alpha5_ref = np.asarray(settings.get("alpha5_ref", np.zeros(steps_executed)), dtype=np.float64)[
+        :steps_executed
+    ]
+    delta_ref = np.asarray(settings.get("delta_ref", np.zeros(steps_executed)), dtype=np.float64)[
+        :steps_executed
+    ]
+
+    alpha5_limit = max(abs(float(controller_params["alpha5_min"])), abs(float(controller_params["alpha5_max"])))
+    delta_limit = abs(float(controller_params["delta_rot_max"]))
+    sat_tol = np.deg2rad(0.5)
+
+    return {
+        "theta_rmse_deg": float(np.rad2deg(np.sqrt(np.mean(theta_err**2)))),
+        "theta_mae_deg": float(np.rad2deg(np.mean(np.abs(theta_err)))),
+        "psi_rmse_deg": float(np.rad2deg(np.sqrt(np.mean(psi_err**2)))),
+        "psi_mae_deg": float(np.rad2deg(np.mean(np.abs(psi_err)))),
+        "alpha5_sat_pct": float(100.0 * np.mean(np.abs(np.abs(alpha5_ref) - alpha5_limit) <= sat_tol)),
+        "delta_sat_pct": float(100.0 * np.mean(np.abs(np.abs(delta_ref) - delta_limit) <= sat_tol)),
+    }
+
+
+def run_hybrid_los_rl_simulation(
+    model_path=None,
+    visualize: bool = False,
+    controller_params_override: dict | None = None,
+) -> dict:
     cfg = HybridSimulationConfig()
     env_cfg = build_fish_env_config()
     sa_settings: dict[str, np.ndarray] = {}
@@ -91,13 +139,18 @@ def run_hybrid_los_rl_simulation(model_path=None, visualize: bool = False) -> di
     }
 
     fish_state = np.zeros(13, dtype=np.float64)
-    fish_state[:3] = fs["v"]
-    fish_state[Q0] = 1.0
+    fish_state[:3] = [0,0,0]
+    fish_state[Q0 : Q3 + 1] = _quat_from_forward_vector(fs["v"])
     fish_state[[PX, PY, PZ]] = fs["p"]
     body_params = load_body_params()
     fin_params = load_fin_params()
 
-    ctrl_state = {"e_z_prev": 0.0, "e_psi_prev": 0.0}
+    ctrl_state = {
+        "e_theta_prev": 0.0,
+        "e_theta_int": 0.0,
+        "e_psi_prev": 0.0,
+        "e_psi_int": 0.0,
+    }
     hist = np.zeros(5, dtype=np.float64)
     c_A = 5.0
     fin_f = 4.0
@@ -106,6 +159,9 @@ def run_hybrid_los_rl_simulation(model_path=None, visualize: bool = False) -> di
     fish_params = {
         key: float(value) for key, value in env_cfg["controller_params"].items()
     }
+    if controller_params_override:
+        for key, value in controller_params_override.items():
+            fish_params[key] = float(value)
 
     local_planner = RLLocalPlanner(model_path=model_path)
     curr_pos = fs["p"].copy()
@@ -125,6 +181,16 @@ def run_hybrid_los_rl_simulation(model_path=None, visualize: bool = False) -> di
 
     sa_settings["cmd_vel_des"] = np.zeros((3, cfg.max_steps), dtype=np.float64)
     sa_settings["vel_act"] = np.zeros((3, cfg.max_steps), dtype=np.float64)
+    sa_settings["theta_ref"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["theta_act"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["e_theta"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["theta_int"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["psi_ref"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["psi_act"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["e_psi"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["psi_int"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["alpha5_ref"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["delta_ref"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
     sa_settings["mode"] = []
 
     for k in range(1, cfg.max_steps + 1):
@@ -159,11 +225,11 @@ def run_hybrid_los_rl_simulation(model_path=None, visualize: bool = False) -> di
             d_min = float(np.min(safe_zone["dists"][safe_zone["is_blocked"]]))
 
         is_obs_in_danger = np.isfinite(d_min) and d_min < sensor_params["danger_distance"]
-        if mode == "GLOBAL_TRACKING" and is_obs_in_danger:
-            mode = "LOCAL_AVOIDANCE"
-            local_planner.reset()
-        elif mode == "LOCAL_AVOIDANCE" and not is_obs_in_danger:
-            mode = "GLOBAL_TRACKING"
+        # if mode == "GLOBAL_TRACKING" and is_obs_in_danger:
+        #     mode = "LOCAL_AVOIDANCE"
+        #     local_planner.reset()
+        # elif mode == "LOCAL_AVOIDANCE" and not is_obs_in_danger:
+        #     mode = "GLOBAL_TRACKING"
 
         sa_settings["mode"].append(mode)
         t_k = (k - 1) * cfg.dt
@@ -221,6 +287,17 @@ def run_hybrid_los_rl_simulation(model_path=None, visualize: bool = False) -> di
             title_hist.append(
                 f"Step {k}: GLOBAL TRACKING (LOS) - {'No obstacles in FOV' if not np.isfinite(d_min) else f'Visible Dist: {d_min:.2f}'}"
             )
+
+        sa_settings["theta_ref"][k - 1] = float(ctrl_state.get("theta_ref", np.nan))
+        sa_settings["theta_act"][k - 1] = float(ctrl_state.get("theta", np.nan))
+        sa_settings["e_theta"][k - 1] = float(ctrl_state.get("e_theta", np.nan))
+        sa_settings["theta_int"][k - 1] = float(ctrl_state.get("e_theta_int", np.nan))
+        sa_settings["psi_ref"][k - 1] = float(ctrl_state.get("psi_ref", np.nan))
+        sa_settings["psi_act"][k - 1] = float(ctrl_state.get("psi", np.nan))
+        sa_settings["e_psi"][k - 1] = float(ctrl_state.get("e_psi", np.nan))
+        sa_settings["psi_int"][k - 1] = float(ctrl_state.get("e_psi_int", np.nan))
+        sa_settings["alpha5_ref"][k - 1] = float(ctrl_state.get("alpha5_ref", np.nan))
+        sa_settings["delta_ref"][k - 1] = float(ctrl_state.get("delta_ref", np.nan))
 
         action_ref = np.clip(action_ref, ref_min, ref_max)
         fish_state, hist = dynamics_step(
@@ -286,6 +363,7 @@ def run_hybrid_los_rl_simulation(model_path=None, visualize: bool = False) -> di
         "final_state": fish_state,
         "final_hist": hist,
     }
+    result["tracking_metrics"] = _compute_tracking_metrics(sa_settings, fish_params, steps_executed)
     if visualize:
         from simulation.visualization import plot_hybrid_result
 
@@ -297,6 +375,7 @@ def main() -> None:
     result = run_hybrid_los_rl_simulation(visualize=True)
     print("reached_goal:", result["reached_goal"])
     print("path_len:", len(result["path_hist"]))
+    print("tracking_metrics:", result["tracking_metrics"])
 
 
 if __name__ == "__main__":

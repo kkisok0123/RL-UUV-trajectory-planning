@@ -60,7 +60,12 @@ class FishAvoidEnv(gym.Env):
         self.t_k = 0.0
         self.step_count = 0
         self.backend = dynamics_backend_name()
-        self.ctrl_state = {"e_z_prev": 0.0, "e_psi_prev": 0.0}
+        self.ctrl_state = {
+            "e_theta_prev": 0.0,
+            "e_theta_int": 0.0,
+            "e_psi_prev": 0.0,
+            "e_psi_int": 0.0,
+        }
 
     def _sample_goal(self) -> np.ndarray:
         spawn = self.cfg["spawn"]
@@ -215,7 +220,12 @@ class FishAvoidEnv(gym.Env):
         self.t_k = 0.0
         self.prev_action = np.zeros(3, dtype=np.float64)
         self.hist = self.trim_refs.copy()
-        self.ctrl_state = {"e_z_prev": 0.0, "e_psi_prev": 0.0}
+        self.ctrl_state = {
+            "e_theta_prev": 0.0,
+            "e_theta_int": 0.0,
+            "e_psi_prev": 0.0,
+            "e_psi_int": 0.0,
+        }
 
         start_xyz = self.np_random.uniform(spawn["start_xyz_low"], spawn["start_xyz_high"]).astype(np.float64)
         yaw0 = float(self.np_random.uniform(-np.pi, np.pi))

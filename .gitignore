@@ -13,3 +13,5 @@ build/
 
 *.tfevents.*
 evaluations.npz
+
+data_saving/

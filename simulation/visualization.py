@@ -94,6 +94,14 @@ def plot_hybrid_result(result: dict, static_obs: list[dict], dyn_obs: list[dict]
     cmd_vel_des = np.asarray(
         settings.get("cmd_vel_des", np.zeros((3, steps_executed))), dtype=np.float64
     )
+    theta_ref = np.asarray(settings.get("theta_ref", np.full(steps_executed, np.nan)), dtype=np.float64)
+    theta_act = np.asarray(settings.get("theta_act", np.full(steps_executed, np.nan)), dtype=np.float64)
+    e_theta = np.asarray(settings.get("e_theta", np.full(steps_executed, np.nan)), dtype=np.float64)
+    psi_ref = np.asarray(settings.get("psi_ref", np.full(steps_executed, np.nan)), dtype=np.float64)
+    psi_act = np.asarray(settings.get("psi_act", np.full(steps_executed, np.nan)), dtype=np.float64)
+    e_psi = np.asarray(settings.get("e_psi", np.full(steps_executed, np.nan)), dtype=np.float64)
+    alpha5_ref = np.asarray(settings.get("alpha5_ref", np.full(steps_executed, np.nan)), dtype=np.float64)
+    delta_ref = np.asarray(settings.get("delta_ref", np.full(steps_executed, np.nan)), dtype=np.float64)
     initial_robot_vel = np.asarray(
         result.get("initial_robot_vel", np.array([1.0, 0.0, 0.0], dtype=np.float64)),
         dtype=np.float64,
@@ -394,5 +402,36 @@ def plot_hybrid_result(result: dict, static_obs: list[dict], dyn_obs: list[dict]
         axes[3].grid(True)
         axes[3].legend(loc="best")
         fig_vel.tight_layout()
+
+    if steps_executed > 0:
+        t_axis = np.arange(steps_executed, dtype=np.float64) * float(sensor_params.get("dt", 0.2))
+        fig_att, axes_att = plt.subplots(4, 1, figsize=(11, 9), sharex=True, facecolor="white")
+        fig_att.suptitle("Attitude Tracking Performance")
+
+        axes_att[0].plot(t_axis, np.rad2deg(theta_ref[:steps_executed]), "r--", linewidth=1.5, label="theta_ref")
+        axes_att[0].plot(t_axis, np.rad2deg(theta_act[:steps_executed]), "b-", linewidth=1.0, label="theta")
+        axes_att[0].set_ylabel("Pitch (deg)")
+        axes_att[0].grid(True)
+        axes_att[0].legend(loc="best")
+
+        axes_att[1].plot(t_axis, np.rad2deg(psi_ref[:steps_executed]), "r--", linewidth=1.5, label="psi_ref")
+        axes_att[1].plot(t_axis, np.rad2deg(psi_act[:steps_executed]), "b-", linewidth=1.0, label="psi")
+        axes_att[1].set_ylabel("Yaw (deg)")
+        axes_att[1].grid(True)
+        axes_att[1].legend(loc="best")
+
+        axes_att[2].plot(t_axis, np.rad2deg(e_theta[:steps_executed]), "g-", linewidth=1.0, label="e_theta")
+        axes_att[2].plot(t_axis, np.rad2deg(e_psi[:steps_executed]), "m-", linewidth=1.0, label="e_psi")
+        axes_att[2].set_ylabel("Error (deg)")
+        axes_att[2].grid(True)
+        axes_att[2].legend(loc="best")
+
+        axes_att[3].plot(t_axis, np.rad2deg(alpha5_ref[:steps_executed]), "c-", linewidth=1.0, label="alpha5_ref")
+        axes_att[3].plot(t_axis, np.rad2deg(delta_ref[:steps_executed]), "k-", linewidth=1.0, label="delta_ref")
+        axes_att[3].set_ylabel("Cmd (deg)")
+        axes_att[3].set_xlabel("Time (s)")
+        axes_att[3].grid(True)
+        axes_att[3].legend(loc="best")
+        fig_att.tight_layout()
 
     plt.show()

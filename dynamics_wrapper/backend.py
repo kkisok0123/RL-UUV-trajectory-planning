@@ -102,3 +102,126 @@ def step(
     return _as_vector(next_state, STATE_DIM, "next_state"), _as_vector(
         hist_values, HIST_DIM, "next_hist"
     )
+
+
+def step_with_body_wrench(
+    state,
+    body_params,
+    dt: float,
+    body_wrench,
+    hist,
+):
+    state = _as_vector(state, STATE_DIM, "state")
+    body_params = _as_vector(body_params, BODY_PARAM_DIM, "body_params")
+    body_wrench = _as_vector(body_wrench, 6, "body_wrench")
+    hist = _as_vector(hist, HIST_DIM, "hist")
+
+    backend = _load_backend()
+    if not hasattr(backend, "step_with_body_wrench"):
+        raise NotImplementedError("The active dynamics backend does not expose step_with_body_wrench")
+
+    next_state, next_hist = backend.step_with_body_wrench(
+        state,
+        body_params,
+        float(dt),
+        body_wrench,
+        hist,
+    )
+    return _as_vector(next_state, STATE_DIM, "next_state"), _as_vector(
+        next_hist, HIST_DIM, "next_hist"
+    )
+
+
+def step_with_joint_rates(
+    state,
+    body_params,
+    fin_params,
+    dt: float,
+    joint_angles,
+    joint_rates,
+):
+    state = _as_vector(state, STATE_DIM, "state")
+    body_params = _as_vector(body_params, BODY_PARAM_DIM, "body_params")
+    fin_params = _as_vector(fin_params, FIN_PARAM_DIM, "fin_params")
+    joint_angles = _as_vector(joint_angles, HIST_DIM, "joint_angles")
+    joint_rates = _as_vector(joint_rates, HIST_DIM, "joint_rates")
+
+    backend = _load_backend()
+    if not hasattr(backend, "step_with_joint_rates"):
+        raise NotImplementedError("The active dynamics backend does not expose step_with_joint_rates")
+
+    next_state, next_joint_angles = backend.step_with_joint_rates(
+        state,
+        body_params,
+        fin_params,
+        float(dt),
+        joint_angles,
+        joint_rates,
+    )
+    return _as_vector(next_state, STATE_DIM, "next_state"), _as_vector(
+        next_joint_angles, HIST_DIM, "next_joint_angles"
+    )
+
+
+def probe_fin_wrenches(
+    state,
+    fin_params,
+    t_k: float,
+    action_ref,
+    hist,
+    c_A: float,
+    fin_f: float,
+):
+    state = _as_vector(state, STATE_DIM, "state")
+    fin_params = _as_vector(fin_params, FIN_PARAM_DIM, "fin_params")
+    action_ref = _as_vector(action_ref, REF_DIM, "action_ref")
+    hist = _as_vector(hist, HIST_DIM, "hist")
+
+    backend = _load_backend()
+    if not hasattr(backend, "probe_fin_wrenches"):
+        raise NotImplementedError("The active dynamics backend does not expose probe_fin_wrenches")
+
+    total, right, left, tail = backend.probe_fin_wrenches(
+        state,
+        fin_params,
+        float(t_k),
+        action_ref,
+        hist,
+        float(c_A),
+        float(fin_f),
+    )
+    return {
+        "total": _as_vector(total, 6, "total"),
+        "right": _as_vector(right, 6, "right"),
+        "left": _as_vector(left, 6, "left"),
+        "tail": _as_vector(tail, 6, "tail"),
+    }
+
+
+def probe_fin_wrenches_with_joint_rates(
+    state,
+    fin_params,
+    joint_angles,
+    joint_rates,
+):
+    state = _as_vector(state, STATE_DIM, "state")
+    fin_params = _as_vector(fin_params, FIN_PARAM_DIM, "fin_params")
+    joint_angles = _as_vector(joint_angles, HIST_DIM, "joint_angles")
+    joint_rates = _as_vector(joint_rates, HIST_DIM, "joint_rates")
+
+    backend = _load_backend()
+    if not hasattr(backend, "probe_fin_wrenches_with_joint_rates"):
+        raise NotImplementedError("The active dynamics backend does not expose probe_fin_wrenches_with_joint_rates")
+
+    total, right, left, tail = backend.probe_fin_wrenches_with_joint_rates(
+        state,
+        fin_params,
+        joint_angles,
+        joint_rates,
+    )
+    return {
+        "total": _as_vector(total, 6, "total"),
+        "right": _as_vector(right, 6, "right"),
+        "left": _as_vector(left, 6, "left"),
+        "tail": _as_vector(tail, 6, "tail"),
+    }

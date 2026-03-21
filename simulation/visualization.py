@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import importlib.util
+
+import matplotlib
+if importlib.util.find_spec("PyQt5") is not None or importlib.util.find_spec("PySide2") is not None:
+    matplotlib.use("Qt5Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation
@@ -69,6 +74,47 @@ def _transform_cone(
     return x, y, z
 
 
+def _scaled_limits(lower: float, upper: float, center: float, scale: float) -> tuple[float, float]:
+    half_range = 0.5 * (upper - lower) * scale
+    return center - half_range, center + half_range
+
+
+def _enable_scroll_zoom(fig: plt.Figure, base_scale: float = 1.2) -> None:
+    def _on_scroll(event) -> None:
+        ax = event.inaxes
+        if ax is None:
+            return
+
+        if event.button == "up":
+            scale = 1.0 / base_scale
+        elif event.button == "down":
+            scale = base_scale
+        else:
+            return
+
+        if getattr(ax, "name", "") == "3d":
+            x0, x1 = ax.get_xlim3d()
+            y0, y1 = ax.get_ylim3d()
+            z0, z1 = ax.get_zlim3d()
+            x_center = float(event.xdata) if event.xdata is not None else 0.5 * (x0 + x1)
+            y_center = float(event.ydata) if event.ydata is not None else 0.5 * (y0 + y1)
+            z_center = 0.5 * (z0 + z1)
+            ax.set_xlim3d(*_scaled_limits(x0, x1, x_center, scale))
+            ax.set_ylim3d(*_scaled_limits(y0, y1, y_center, scale))
+            ax.set_zlim3d(*_scaled_limits(z0, z1, z_center, scale))
+        else:
+            x0, x1 = ax.get_xlim()
+            y0, y1 = ax.get_ylim()
+            x_center = float(event.xdata) if event.xdata is not None else 0.5 * (x0 + x1)
+            y_center = float(event.ydata) if event.ydata is not None else 0.5 * (y0 + y1)
+            ax.set_xlim(*_scaled_limits(x0, x1, x_center, scale))
+            ax.set_ylim(*_scaled_limits(y0, y1, y_center, scale))
+
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect("scroll_event", _on_scroll)
+
+
 def plot_hybrid_result(result: dict, static_obs: list[dict], dyn_obs: list[dict], goal: np.ndarray) -> None:
     del dyn_obs
 
@@ -94,10 +140,19 @@ def plot_hybrid_result(result: dict, static_obs: list[dict], dyn_obs: list[dict]
     cmd_vel_des = np.asarray(
         settings.get("cmd_vel_des", np.zeros((3, steps_executed))), dtype=np.float64
     )
+    fin_wrench_des_total = np.asarray(
+        settings.get("fin_wrench_des_total", np.zeros((6, steps_executed))),
+        dtype=np.float64,
+    )
+    fin_wrench_real_total = np.asarray(
+        settings.get("fin_wrench_real_total", np.zeros((6, steps_executed))),
+        dtype=np.float64,
+    )
     initial_robot_vel = np.asarray(
         result.get("initial_robot_vel", np.array([1.0, 0.0, 0.0], dtype=np.float64)),
         dtype=np.float64,
     )
+    dt = float(result.get("dt", sensor_params.get("dt", 0.2)))
 
     if dyn_obs_hist.ndim == 3 and dyn_obs_hist.shape[0] > len(valid_path):
         dyn_obs_hist = dyn_obs_hist[: len(valid_path)]
@@ -367,9 +422,10 @@ def plot_hybrid_result(result: dict, static_obs: list[dict], dyn_obs: list[dict]
     fig._robot_anim = anim
     _LIVE_ANIMATIONS.append(anim)
     plt.tight_layout()
+    _enable_scroll_zoom(fig)
 
     if steps_executed > 0 and cmd_vel_des.shape[1] >= steps_executed and vel_act.shape[1] >= steps_executed:
-        t_axis = np.arange(steps_executed, dtype=np.float64) * float(sensor_params.get("dt", 0.2))
+        t_axis = np.arange(steps_executed, dtype=np.float64) * dt
         fig_vel, axes = plt.subplots(4, 1, figsize=(11, 8), sharex=True, facecolor="white")
         fig_vel.suptitle("Velocity Tracking Performance")
 
@@ -394,5 +450,54 @@ def plot_hybrid_result(result: dict, static_obs: list[dict], dyn_obs: list[dict]
         axes[3].grid(True)
         axes[3].legend(loc="best")
         fig_vel.tight_layout()
+        _enable_scroll_zoom(fig_vel)
+
+    if (
+        steps_executed > 0
+        and fin_wrench_des_total.shape[1] >= steps_executed
+        and fin_wrench_real_total.shape[1] >= steps_executed
+        and np.any(np.abs(fin_wrench_des_total[:, :steps_executed]) > 0.0)
+    ):
+        t_axis = np.arange(steps_executed, dtype=np.float64) * dt
+        fin_error = fin_wrench_des_total[:, :steps_executed] - fin_wrench_real_total[:, :steps_executed]
+        fin_error_norm = np.sqrt(np.sum(fin_error**2, axis=0))
+        component_labels = ["Fx", "Fy", "Fz", "Mx", "My", "Mz"]
+        fig_wrench, axes_wrench = plt.subplots(3, 1, figsize=(12, 9), sharex=True, facecolor="white")
+        fig_wrench.suptitle("Layer 3 Fin Wrench Tracking")
+
+        for idx, label in enumerate(component_labels):
+            axes_wrench[0].plot(
+                t_axis,
+                fin_wrench_des_total[idx, :steps_executed],
+                linewidth=1.3,
+                linestyle="--",
+                label=f"{label} desired",
+            )
+            axes_wrench[1].plot(
+                t_axis,
+                fin_wrench_real_total[idx, :steps_executed],
+                linewidth=1.0,
+                label=f"{label} real",
+            )
+            axes_wrench[2].plot(
+                t_axis,
+                fin_error[idx],
+                linewidth=1.0,
+                label=f"{label} error",
+            )
+
+        axes_wrench[0].set_ylabel("Desired")
+        axes_wrench[0].grid(True)
+        axes_wrench[0].legend(loc="best", ncol=3)
+        axes_wrench[1].set_ylabel("Real")
+        axes_wrench[1].grid(True)
+        axes_wrench[1].legend(loc="best", ncol=3)
+        axes_wrench[2].plot(t_axis, fin_error_norm, "k--", linewidth=1.5, label="||error||")
+        axes_wrench[2].set_ylabel("Error")
+        axes_wrench[2].set_xlabel("Time (s)")
+        axes_wrench[2].grid(True)
+        axes_wrench[2].legend(loc="best", ncol=3)
+        fig_wrench.tight_layout()
+        _enable_scroll_zoom(fig_wrench)
 
     plt.show()

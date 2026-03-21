@@ -64,10 +64,184 @@ static py::tuple py_step(py::array_t<double, py::array::c_style | py::array::for
   return py::make_tuple(next_state, next_hist);
 }
 
+static py::tuple py_step_with_body_wrench(
+    py::array_t<double, py::array::c_style | py::array::forcecast> state,
+    py::array_t<double, py::array::c_style | py::array::forcecast> body_params,
+    double dt,
+    py::array_t<double, py::array::c_style | py::array::forcecast> body_wrench,
+    py::array_t<double, py::array::c_style | py::array::forcecast> hist) {
+  require_vector(state, NX, "state");
+  require_vector(body_params, 36, "body_params");
+  require_vector(body_wrench, 6, "body_wrench");
+  require_vector(hist, 5, "hist");
+
+  if (dt < 0.0) {
+    throw std::invalid_argument("dt must be non-negative");
+  }
+
+  double state_buf[NX];
+  double bp_buf[36];
+  double wrench_buf[6];
+  double hist_buf[5];
+  double hist_out[5];
+
+  std::memcpy(state_buf, state.data(), sizeof(state_buf));
+  std::memcpy(bp_buf, body_params.data(), sizeof(bp_buf));
+  std::memcpy(wrench_buf, body_wrench.data(), sizeof(wrench_buf));
+  std::memcpy(hist_buf, hist.data(), sizeof(hist_buf));
+
+  simulate_step_with_body_wrench_arrays(state_buf, bp_buf, dt, wrench_buf,
+                                        hist_buf, hist_out);
+
+  py::array_t<double> next_state({NX});
+  py::array_t<double> next_hist({5});
+  std::memcpy(next_state.mutable_data(), state_buf, sizeof(state_buf));
+  std::memcpy(next_hist.mutable_data(), hist_out, sizeof(hist_out));
+  return py::make_tuple(next_state, next_hist);
+}
+
+static py::tuple py_step_with_joint_rates(
+    py::array_t<double, py::array::c_style | py::array::forcecast> state,
+    py::array_t<double, py::array::c_style | py::array::forcecast> body_params,
+    py::array_t<double, py::array::c_style | py::array::forcecast> fin_params,
+    double dt,
+    py::array_t<double, py::array::c_style | py::array::forcecast> joint_angles,
+    py::array_t<double, py::array::c_style | py::array::forcecast> joint_rates) {
+  require_vector(state, NX, "state");
+  require_vector(body_params, 36, "body_params");
+  require_vector(fin_params, 38, "fin_params");
+  require_vector(joint_angles, 5, "joint_angles");
+  require_vector(joint_rates, 5, "joint_rates");
+
+  if (dt < 0.0) {
+    throw std::invalid_argument("dt must be non-negative");
+  }
+
+  double state_buf[NX];
+  double bp_buf[36];
+  double fp_buf[38];
+  double joint_angles_buf[5];
+  double joint_rates_buf[5];
+  double joint_angles_out[5];
+
+  std::memcpy(state_buf, state.data(), sizeof(state_buf));
+  std::memcpy(bp_buf, body_params.data(), sizeof(bp_buf));
+  std::memcpy(fp_buf, fin_params.data(), sizeof(fp_buf));
+  std::memcpy(joint_angles_buf, joint_angles.data(), sizeof(joint_angles_buf));
+  std::memcpy(joint_rates_buf, joint_rates.data(), sizeof(joint_rates_buf));
+
+  simulate_step_with_joint_rates_arrays(state_buf, bp_buf, fp_buf, dt,
+                                        joint_angles_buf, joint_rates_buf,
+                                        joint_angles_out);
+
+  py::array_t<double> next_state({NX});
+  py::array_t<double> next_joint_angles({5});
+  std::memcpy(next_state.mutable_data(), state_buf, sizeof(state_buf));
+  std::memcpy(next_joint_angles.mutable_data(), joint_angles_out,
+              sizeof(joint_angles_out));
+  return py::make_tuple(next_state, next_joint_angles);
+}
+
+static py::tuple py_probe_fin_wrenches(
+    py::array_t<double, py::array::c_style | py::array::forcecast> state,
+    py::array_t<double, py::array::c_style | py::array::forcecast> fin_params,
+    double t_k,
+    py::array_t<double, py::array::c_style | py::array::forcecast> action_ref,
+    py::array_t<double, py::array::c_style | py::array::forcecast> hist,
+    double c_A, double fin_f) {
+  require_vector(state, NX, "state");
+  require_vector(fin_params, 38, "fin_params");
+  require_vector(action_ref, 5, "action_ref");
+  require_vector(hist, 5, "hist");
+
+  if (fin_f <= 0.0) {
+    throw std::invalid_argument("fin_f must be positive");
+  }
+
+  double state_buf[NX];
+  double fp_buf[38];
+  double ref_buf[5];
+  double hist_buf[5];
+  double total_buf[6];
+  double right_buf[6];
+  double left_buf[6];
+  double tail_buf[6];
+
+  std::memcpy(state_buf, state.data(), sizeof(state_buf));
+  std::memcpy(fp_buf, fin_params.data(), sizeof(fp_buf));
+  std::memcpy(ref_buf, action_ref.data(), sizeof(ref_buf));
+  std::memcpy(hist_buf, hist.data(), sizeof(hist_buf));
+
+  probe_fin_wrench_arrays(state_buf, fp_buf, t_k, ref_buf, hist_buf, c_A,
+                          fin_f, total_buf, right_buf, left_buf, tail_buf);
+
+  py::array_t<double> total({6});
+  py::array_t<double> right({6});
+  py::array_t<double> left({6});
+  py::array_t<double> tail({6});
+  std::memcpy(total.mutable_data(), total_buf, sizeof(total_buf));
+  std::memcpy(right.mutable_data(), right_buf, sizeof(right_buf));
+  std::memcpy(left.mutable_data(), left_buf, sizeof(left_buf));
+  std::memcpy(tail.mutable_data(), tail_buf, sizeof(tail_buf));
+  return py::make_tuple(total, right, left, tail);
+}
+
+static py::tuple py_probe_fin_wrenches_with_joint_rates(
+    py::array_t<double, py::array::c_style | py::array::forcecast> state,
+    py::array_t<double, py::array::c_style | py::array::forcecast> fin_params,
+    py::array_t<double, py::array::c_style | py::array::forcecast> joint_angles,
+    py::array_t<double, py::array::c_style | py::array::forcecast> joint_rates) {
+  require_vector(state, NX, "state");
+  require_vector(fin_params, 38, "fin_params");
+  require_vector(joint_angles, 5, "joint_angles");
+  require_vector(joint_rates, 5, "joint_rates");
+
+  double state_buf[NX];
+  double fp_buf[38];
+  double joint_angles_buf[5];
+  double joint_rates_buf[5];
+  double total_buf[6];
+  double right_buf[6];
+  double left_buf[6];
+  double tail_buf[6];
+
+  std::memcpy(state_buf, state.data(), sizeof(state_buf));
+  std::memcpy(fp_buf, fin_params.data(), sizeof(fp_buf));
+  std::memcpy(joint_angles_buf, joint_angles.data(), sizeof(joint_angles_buf));
+  std::memcpy(joint_rates_buf, joint_rates.data(), sizeof(joint_rates_buf));
+
+  probe_fin_wrench_with_joint_rates_arrays(state_buf, fp_buf, joint_angles_buf,
+                                           joint_rates_buf, total_buf,
+                                           right_buf, left_buf, tail_buf);
+
+  py::array_t<double> total({6});
+  py::array_t<double> right({6});
+  py::array_t<double> left({6});
+  py::array_t<double> tail({6});
+  std::memcpy(total.mutable_data(), total_buf, sizeof(total_buf));
+  std::memcpy(right.mutable_data(), right_buf, sizeof(right_buf));
+  std::memcpy(left.mutable_data(), left_buf, sizeof(left_buf));
+  std::memcpy(tail.mutable_data(), tail_buf, sizeof(tail_buf));
+  return py::make_tuple(total, right, left, tail);
+}
+
 PYBIND11_MODULE(fish_dynamics, m) {
   m.doc() = "pybind11 wrapper around the fish RK4 dynamics step";
   m.def("step", &py_step, py::arg("state"), py::arg("body_params"),
         py::arg("fin_params"), py::arg("dt"), py::arg("t_k"),
         py::arg("action_ref"), py::arg("hist"), py::arg("c_A"),
         py::arg("fin_f"));
+  m.def("step_with_body_wrench", &py_step_with_body_wrench, py::arg("state"),
+        py::arg("body_params"), py::arg("dt"), py::arg("body_wrench"),
+        py::arg("hist"));
+  m.def("probe_fin_wrenches", &py_probe_fin_wrenches, py::arg("state"),
+        py::arg("fin_params"), py::arg("t_k"), py::arg("action_ref"),
+        py::arg("hist"), py::arg("c_A"), py::arg("fin_f"));
+  m.def("step_with_joint_rates", &py_step_with_joint_rates, py::arg("state"),
+        py::arg("body_params"), py::arg("fin_params"), py::arg("dt"),
+        py::arg("joint_angles"), py::arg("joint_rates"));
+  m.def("probe_fin_wrenches_with_joint_rates",
+        &py_probe_fin_wrenches_with_joint_rates, py::arg("state"),
+        py::arg("fin_params"), py::arg("joint_angles"),
+        py::arg("joint_rates"));
 }

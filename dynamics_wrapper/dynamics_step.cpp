@@ -118,6 +118,22 @@ static void compute_angles(double t_local, double t_k, double fin_f, double c_A,
   as.alpha5t = A5d;
 }
 
+static void compute_direct_angles(double t_local, const double joint_angles[5],
+                                  const double joint_rates[5],
+                                  AngleState &as) {
+  as.alpha1 = joint_angles[0] + joint_rates[0] * t_local;
+  as.alpha2 = joint_angles[1] + joint_rates[1] * t_local;
+  as.alpha3 = joint_angles[2] + joint_rates[2] * t_local;
+  as.alpha4 = joint_angles[3] + joint_rates[3] * t_local;
+  as.alpha5 = joint_angles[4] + joint_rates[4] * t_local;
+
+  as.alpha1t = joint_rates[0];
+  as.alpha2t = joint_rates[1];
+  as.alpha3t = joint_rates[2];
+  as.alpha4t = joint_rates[3];
+  as.alpha5t = joint_rates[4];
+}
+
 /* ===== 3x3 matrix helpers ===== */
 static void mat3_mul_vec3(const double M[9], const double v[3], double out[3]) {
   /* M stored row-major: M[row*3+col] */
@@ -675,6 +691,176 @@ static void dynamics_rhs(const double x[NX], const BodyParams &bp,
     dxdt[10 + i] = dPos[i];
 }
 
+static void dynamics_rhs_with_body_wrench(const double x[NX],
+                                          const BodyParams &bp,
+                                          const double control_wrench[6],
+                                          double dxdt[NX]) {
+  double vx = x[0], vy = x[1], vz = x[2];
+  double wx = x[3], wy = x[4], wz = x[5];
+  double q0 = x[6], q1 = x[7], q2 = x[8], q3 = x[9];
+
+  double RIE[9];
+  RIE[0] = q0 * q0 + q1 * q1 - q2 * q2 - q3 * q3;
+  RIE[1] = 2 * (q1 * q2 + q0 * q3);
+  RIE[2] = 2 * (q1 * q3 - q0 * q2);
+  RIE[3] = 2 * (q1 * q2 - q0 * q3);
+  RIE[4] = q0 * q0 - q1 * q1 + q2 * q2 - q3 * q3;
+  RIE[5] = 2 * (q0 * q1 + q3 * q2);
+  RIE[6] = 2 * (q1 * q3 + q0 * q2);
+  RIE[7] = 2 * (q2 * q3 - q0 * q1);
+  RIE[8] = q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3;
+
+  double M[6][6];
+  memset(M, 0, sizeof(M));
+  M[0][0] = bp.m;
+  M[0][4] = bp.m * bp.rBG_3;
+  M[0][5] = -bp.m * bp.rBG_2;
+  M[1][1] = bp.m;
+  M[1][3] = -bp.m * bp.rBG_3;
+  M[1][5] = bp.m * bp.rBG_1;
+  M[2][2] = bp.m;
+  M[2][3] = bp.m * bp.rBG_2;
+  M[2][4] = -bp.m * bp.rBG_1;
+  M[3][1] = -bp.m * bp.rBG_3;
+  M[3][2] = bp.m * bp.rBG_2;
+  M[3][3] = bp.J11;
+  M[3][4] = -bp.J12;
+  M[3][5] = -bp.J13;
+  M[4][0] = bp.m * bp.rBG_3;
+  M[4][2] = -bp.m * bp.rBG_1;
+  M[4][3] = -bp.J21;
+  M[4][4] = bp.J22;
+  M[4][5] = -bp.J23;
+  M[5][0] = -bp.m * bp.rBG_2;
+  M[5][1] = bp.m * bp.rBG_1;
+  M[5][3] = -bp.J31;
+  M[5][4] = -bp.J32;
+  M[5][5] = bp.J33;
+
+  double Lam[6][6];
+  memset(Lam, 0, sizeof(Lam));
+  Lam[0][0] = bp.lambda11;
+  Lam[1][1] = bp.lambda22;
+  Lam[1][5] = bp.lambda26;
+  Lam[2][2] = bp.lambda33;
+  Lam[2][4] = bp.lambda35;
+  Lam[3][3] = bp.lambda44;
+  Lam[4][2] = bp.lambda35;
+  Lam[4][4] = bp.lambda55;
+  Lam[5][1] = bp.lambda26;
+  Lam[5][5] = bp.lambda66;
+
+  double ML[6][6];
+  for (int i = 0; i < 6; i++)
+    for (int j = 0; j < 6; j++)
+      ML[i][j] = M[i][j] + Lam[i][j];
+
+  double OL[6][6];
+  memset(OL, 0, sizeof(OL));
+  OL[0][1] = -wz;
+  OL[0][2] = wy;
+  OL[1][0] = wz;
+  OL[1][2] = -wx;
+  OL[2][0] = -wy;
+  OL[2][1] = wx;
+  OL[3][4] = -wz;
+  OL[3][5] = wy;
+  OL[4][3] = wz;
+  OL[4][5] = -wx;
+  OL[5][3] = -wy;
+  OL[5][4] = wx;
+  OL[3][1] += -vz;
+  OL[3][2] += vy;
+  OL[4][0] += vz;
+  OL[4][2] += -vx;
+  OL[5][0] += -vy;
+  OL[5][1] += vx;
+
+  double vel6[6] = {vx, vy, vz, wx, wy, wz};
+
+  double MLv[6];
+  for (int i = 0; i < 6; i++) {
+    MLv[i] = 0;
+    for (int j = 0; j < 6; j++)
+      MLv[i] += ML[i][j] * vel6[j];
+  }
+
+  double neg_OL_MLv[6];
+  for (int i = 0; i < 6; i++) {
+    neg_OL_MLv[i] = 0;
+    for (int j = 0; j < 6; j++)
+      neg_OL_MLv[i] -= OL[i][j] * MLv[j];
+  }
+
+  double grav_world[3] = {0, 0, -bp.B};
+  double fw[3];
+  mat3_mul_vec3(RIE, grav_world, fw);
+
+  double grav_world2[3] = {0, 0, bp.G};
+  double fg[3];
+  mat3_mul_vec3(RIE, grav_world2, fg);
+  double rBG[3] = {bp.rBG_1, bp.rBG_2, bp.rBG_3};
+  double mg[3];
+  cross3(rBG, fg, mg);
+
+  double alpha_a = atan2(vz, vx);
+  double beta_a = atan2(vy, sqrt(vx * vx + vz * vz));
+  double pd = 0.5 * bp.rho_Fluid * (vx * vx + vy * vy + vz * vz);
+
+  double Fp[6];
+  Fp[0] = bp.A * pd * bp.P1;
+  Fp[1] = bp.A * pd * (bp.P2_beta * beta_a + bp.P1 * sin(beta_a));
+  Fp[2] = bp.A * pd * (bp.P3_alpha * alpha_a + bp.P1 * sin(alpha_a));
+  Fp[3] = 0;
+  Fp[4] = bp.A * bp.L * pd * bp.P2bar_alpha * alpha_a;
+  Fp[5] = bp.A * bp.L * pd * bp.P3bar_beta * beta_a;
+
+  double qdyn = 0.5 * bp.rho_Fluid * sqrt(vx * vx + vy * vy + vz * vz) * bp.A;
+  double Fd[6];
+  Fd[0] = 0;
+  Fd[1] = qdyn * bp.L * bp.D2_w3 * wz;
+  Fd[2] = qdyn * bp.L * bp.D3_w2 * wy;
+  Fd[3] = qdyn * bp.L * bp.L * bp.D1bar_w1 * wx;
+  Fd[4] = qdyn * bp.L * bp.L * bp.D2bar_w2 * wy;
+  Fd[5] = qdyn * bp.L * bp.L * bp.D3bar_w3 * wz;
+
+  double F61[6];
+  F61[0] = fw[0] + fg[0] + Fp[0] + Fd[0] + control_wrench[0];
+  F61[1] = fw[1] + fg[1] + Fp[1] + Fd[1] + control_wrench[1];
+  F61[2] = fw[2] + fg[2] + Fp[2] + Fd[2] + control_wrench[2];
+  F61[3] = 0 + mg[0] + Fp[3] + Fd[3] + control_wrench[3];
+  F61[4] = 0 + mg[1] + Fp[4] + Fd[4] + control_wrench[4];
+  F61[5] = 0 + mg[2] + Fp[5] + Fd[5] + control_wrench[5];
+
+  double rhs[6];
+  for (int i = 0; i < 6; i++)
+    rhs[i] = neg_OL_MLv[i] + F61[i];
+
+  double ML_copy[6][6];
+  memcpy(ML_copy, ML, sizeof(ML));
+  double dPdt[6];
+  solve6x6(ML_copy, rhs, dPdt);
+
+  double dQdt[4];
+  dQdt[0] = 0.5 * (-(q1 * wx + q2 * wy + q3 * wz));
+  dQdt[1] = 0.5 * (q0 * wx + q2 * wz - q3 * wy);
+  dQdt[2] = 0.5 * (q0 * wy - q1 * wz + q3 * wx);
+  dQdt[3] = 0.5 * (q0 * wz + q1 * wy - q2 * wx);
+
+  double RIE_T[9];
+  mat3_transpose(RIE, RIE_T);
+  double v_body[3] = {vx, vy, vz};
+  double dPos[3];
+  mat3_mul_vec3(RIE_T, v_body, dPos);
+
+  for (int i = 0; i < 6; i++)
+    dxdt[i] = dPdt[i];
+  for (int i = 0; i < 4; i++)
+    dxdt[6 + i] = dQdt[i];
+  for (int i = 0; i < 3; i++)
+    dxdt[10 + i] = dPos[i];
+}
+
 /* ===== Fixed-step RK4 Integrator ===== */
 static void rk4_step(double x[NX], double h, const BodyParams &bp,
                      const FinParams &fp, double t_local, double t_k,
@@ -716,6 +902,59 @@ static void rk4_step(double x[NX], double h, const BodyParams &bp,
   dynamics_rhs(xtmp, bp, fp, as, k4);
 
   /* Update */
+  for (int i = 0; i < NX; i++)
+    x[i] += (h / 6.0) * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]);
+}
+
+static void rk4_step_with_body_wrench(double x[NX], double h,
+                                      const BodyParams &bp,
+                                      const double control_wrench[6]) {
+  double k1[NX], k2[NX], k3[NX], k4[NX], xtmp[NX];
+
+  dynamics_rhs_with_body_wrench(x, bp, control_wrench, k1);
+
+  for (int i = 0; i < NX; i++)
+    xtmp[i] = x[i] + 0.5 * h * k1[i];
+  dynamics_rhs_with_body_wrench(xtmp, bp, control_wrench, k2);
+
+  for (int i = 0; i < NX; i++)
+    xtmp[i] = x[i] + 0.5 * h * k2[i];
+  dynamics_rhs_with_body_wrench(xtmp, bp, control_wrench, k3);
+
+  for (int i = 0; i < NX; i++)
+    xtmp[i] = x[i] + h * k3[i];
+  dynamics_rhs_with_body_wrench(xtmp, bp, control_wrench, k4);
+
+  for (int i = 0; i < NX; i++)
+    x[i] += (h / 6.0) * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]);
+}
+
+static void rk4_step_with_joint_rates(double x[NX], double h,
+                                      const BodyParams &bp,
+                                      const FinParams &fp,
+                                      const double joint_angles[5],
+                                      const double joint_rates[5]) {
+  double k1[NX], k2[NX], k3[NX], k4[NX], xtmp[NX];
+  AngleState as;
+
+  compute_direct_angles(0.0, joint_angles, joint_rates, as);
+  dynamics_rhs(x, bp, fp, as, k1);
+
+  for (int i = 0; i < NX; i++)
+    xtmp[i] = x[i] + 0.5 * h * k1[i];
+  compute_direct_angles(0.5 * h, joint_angles, joint_rates, as);
+  dynamics_rhs(xtmp, bp, fp, as, k2);
+
+  for (int i = 0; i < NX; i++)
+    xtmp[i] = x[i] + 0.5 * h * k2[i];
+  compute_direct_angles(0.5 * h, joint_angles, joint_rates, as);
+  dynamics_rhs(xtmp, bp, fp, as, k3);
+
+  for (int i = 0; i < NX; i++)
+    xtmp[i] = x[i] + h * k3[i];
+  compute_direct_angles(h, joint_angles, joint_rates, as);
+  dynamics_rhs(xtmp, bp, fp, as, k4);
+
   for (int i = 0; i < NX; i++)
     x[i] += (h / 6.0) * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]);
 }
@@ -786,6 +1025,71 @@ static void load_fin_params_from_array(const double fp_arr[38], FinParams &fp) {
   fp.f = fp_arr[fi++];
 }
 
+static void pack_control_wrench(const double FB[3], const double MB[3],
+                                double out[6]) {
+  out[0] = FB[0];
+  out[1] = FB[1];
+  out[2] = FB[2];
+  out[3] = MB[0];
+  out[4] = MB[1];
+  out[5] = MB[2];
+}
+
+static void probe_fin_wrench_from_angle_state(const double state[NX],
+                                              const FinParams &fp,
+                                              const AngleState &as,
+                                              double total_out[6],
+                                              double right_out[6],
+                                              double left_out[6],
+                                              double tail_out[6]) {
+  double v3[3] = {state[0], state[1], state[2]};
+  double w3[3] = {state[3], state[4], state[5]};
+
+  double FB_r[3], MB_r[3], FB_l[3], MB_l[3], FB_t[3], MB_t[3];
+  right_fin_force(fp, as, v3, w3, FB_r, MB_r);
+  left_fin_force(fp, as, v3, w3, FB_l, MB_l);
+  tail_fin_force(fp, as, v3, w3, FB_t, MB_t);
+
+  pack_control_wrench(FB_r, MB_r, right_out);
+  pack_control_wrench(FB_l, MB_l, left_out);
+  pack_control_wrench(FB_t, MB_t, tail_out);
+  for (int i = 0; i < 6; ++i) {
+    total_out[i] = right_out[i] + left_out[i] + tail_out[i];
+  }
+}
+
+static void probe_fin_wrench_arrays(const double state[NX],
+                                    const double fp_arr[38], double t_k,
+                                    const double refs[5],
+                                    const double hist_in[5], double c_A,
+                                    double fin_f, double total_out[6],
+                                    double right_out[6], double left_out[6],
+                                    double tail_out[6]) {
+  FinParams fp;
+  load_fin_params_from_array(fp_arr, fp);
+
+  AngleState as;
+  compute_angles(0.0, t_k, fin_f, c_A, refs[0], refs[1], refs[2], refs[3],
+                 refs[4], hist_in[0], hist_in[1], hist_in[2], hist_in[3],
+                 hist_in[4], as);
+  probe_fin_wrench_from_angle_state(state, fp, as, total_out, right_out,
+                                    left_out, tail_out);
+}
+
+static void probe_fin_wrench_with_joint_rates_arrays(
+    const double state[NX], const double fp_arr[38],
+    const double joint_angles[5], const double joint_rates[5],
+    double total_out[6], double right_out[6], double left_out[6],
+    double tail_out[6]) {
+  FinParams fp;
+  load_fin_params_from_array(fp_arr, fp);
+
+  AngleState as;
+  compute_direct_angles(0.0, joint_angles, joint_rates, as);
+  probe_fin_wrench_from_angle_state(state, fp, as, total_out, right_out,
+                                    left_out, tail_out);
+}
+
 static void simulate_step_arrays(double state[NX], const double bp_arr[36],
                                  const double fp_arr[38], double dt_total,
                                  double t_k, const double refs[5],
@@ -824,6 +1128,71 @@ static void simulate_step_arrays(double state[NX], const double bp_arr[36],
   hist_out[2] = cpg_A_val(refs[2], hist_in[2], c_A, dt_total);
   hist_out[3] = cpg_A_val(refs[3], hist_in[3], c_A, dt_total);
   hist_out[4] = cpg_A_val(refs[4], hist_in[4], c_A, dt_total);
+}
+
+static void simulate_step_with_body_wrench_arrays(
+    double state[NX], const double bp_arr[36], double dt_total,
+    const double control_wrench[6], const double hist_in[5],
+    double hist_out[5]) {
+  BodyParams bp;
+  load_body_params_from_array(bp_arr, bp);
+
+  const int n_steps = 4;
+  double h = dt_total / n_steps;
+
+  for (int step = 0; step < n_steps; step++) {
+    rk4_step_with_body_wrench(state, h, bp, control_wrench);
+  }
+
+  double qnorm = sqrt(state[6] * state[6] + state[7] * state[7] +
+                      state[8] * state[8] + state[9] * state[9]);
+  if (qnorm > 1e-12) {
+    state[6] /= qnorm;
+    state[7] /= qnorm;
+    state[8] /= qnorm;
+    state[9] /= qnorm;
+  }
+
+  for (int i = 0; i < 5; i++) {
+    hist_out[i] = hist_in[i];
+  }
+}
+
+static void simulate_step_with_joint_rates_arrays(
+    double state[NX], const double bp_arr[36], const double fp_arr[38],
+    double dt_total, const double joint_angles_in[5],
+    const double joint_rates[5], double joint_angles_out[5]) {
+  BodyParams bp;
+  FinParams fp;
+  load_body_params_from_array(bp_arr, bp);
+  load_fin_params_from_array(fp_arr, fp);
+
+  const int n_steps = 4;
+  double h = dt_total / n_steps;
+  double joint_angles_step[5];
+  for (int i = 0; i < 5; ++i) {
+    joint_angles_step[i] = joint_angles_in[i];
+  }
+
+  for (int step = 0; step < n_steps; step++) {
+    rk4_step_with_joint_rates(state, h, bp, fp, joint_angles_step, joint_rates);
+    for (int i = 0; i < 5; ++i) {
+      joint_angles_step[i] += joint_rates[i] * h;
+    }
+  }
+
+  double qnorm = sqrt(state[6] * state[6] + state[7] * state[7] +
+                      state[8] * state[8] + state[9] * state[9]);
+  if (qnorm > 1e-12) {
+    state[6] /= qnorm;
+    state[7] /= qnorm;
+    state[8] /= qnorm;
+    state[9] /= qnorm;
+  }
+
+  for (int i = 0; i < 5; ++i) {
+    joint_angles_out[i] = joint_angles_step[i];
+  }
 }
 
 #ifndef FISH_DYNAMICS_PYBIND
@@ -932,9 +1301,264 @@ static PyObject *py_update(PyObject *self, PyObject *args) {
   return result;
 }
 
+static PyObject *build_fixed_list(const double *values, int len) {
+  PyObject *list = PyList_New(len);
+  if (list == nullptr)
+    return nullptr;
+
+  for (int i = 0; i < len; ++i) {
+    PyObject *value = PyFloat_FromDouble(values[i]);
+    if (value == nullptr) {
+      Py_DECREF(list);
+      return nullptr;
+    }
+    PyList_SET_ITEM(list, i, value);
+  }
+  return list;
+}
+
+static PyObject *py_probe_fin_wrenches(PyObject *self, PyObject *args) {
+  (void)self;
+
+  PyObject *fish_state_obj = nullptr;
+  PyObject *fin_params_obj = nullptr;
+  PyObject *action_ref_obj = nullptr;
+  PyObject *hist_obj = nullptr;
+  double t_k;
+  double c_A;
+  double fin_f;
+
+  if (!PyArg_ParseTuple(args, "OOdOOdd", &fish_state_obj, &fin_params_obj, &t_k,
+                        &action_ref_obj, &hist_obj, &c_A, &fin_f)) {
+    return nullptr;
+  }
+
+  double state[NX];
+  if (!load_double_sequence(fish_state_obj, NX, state, "fish_state"))
+    return nullptr;
+
+  double fp_arr[38];
+  if (!load_double_sequence(fin_params_obj, 38, fp_arr, "fin_params"))
+    return nullptr;
+
+  double refs[5];
+  if (!load_double_sequence(action_ref_obj, 5, refs, "action_ref"))
+    return nullptr;
+
+  double hist_in[5];
+  if (!load_double_sequence(hist_obj, 5, hist_in, "hist"))
+    return nullptr;
+
+  if (fin_f <= 0.0) {
+    PyErr_SetString(PyExc_ValueError, "fin_f must be positive");
+    return nullptr;
+  }
+
+  double total_out[6], right_out[6], left_out[6], tail_out[6];
+  probe_fin_wrench_arrays(state, fp_arr, t_k, refs, hist_in, c_A, fin_f,
+                          total_out, right_out, left_out, tail_out);
+
+  PyObject *total_list = build_fixed_list(total_out, 6);
+  PyObject *right_list = build_fixed_list(right_out, 6);
+  PyObject *left_list = build_fixed_list(left_out, 6);
+  PyObject *tail_list = build_fixed_list(tail_out, 6);
+  if (total_list == nullptr || right_list == nullptr || left_list == nullptr ||
+      tail_list == nullptr) {
+    Py_XDECREF(total_list);
+    Py_XDECREF(right_list);
+    Py_XDECREF(left_list);
+    Py_XDECREF(tail_list);
+    return nullptr;
+  }
+
+  PyObject *result =
+      Py_BuildValue("(OOOO)", total_list, right_list, left_list, tail_list);
+  Py_DECREF(total_list);
+  Py_DECREF(right_list);
+  Py_DECREF(left_list);
+  Py_DECREF(tail_list);
+  return result;
+}
+
+static PyObject *py_probe_fin_wrenches_with_joint_rates(PyObject *self,
+                                                        PyObject *args) {
+  (void)self;
+
+  PyObject *fish_state_obj = nullptr;
+  PyObject *fin_params_obj = nullptr;
+  PyObject *joint_angles_obj = nullptr;
+  PyObject *joint_rates_obj = nullptr;
+
+  if (!PyArg_ParseTuple(args, "OOOO", &fish_state_obj, &fin_params_obj,
+                        &joint_angles_obj, &joint_rates_obj)) {
+    return nullptr;
+  }
+
+  double state[NX];
+  if (!load_double_sequence(fish_state_obj, NX, state, "fish_state"))
+    return nullptr;
+
+  double fp_arr[38];
+  if (!load_double_sequence(fin_params_obj, 38, fp_arr, "fin_params"))
+    return nullptr;
+
+  double joint_angles[5];
+  if (!load_double_sequence(joint_angles_obj, 5, joint_angles, "joint_angles"))
+    return nullptr;
+
+  double joint_rates[5];
+  if (!load_double_sequence(joint_rates_obj, 5, joint_rates, "joint_rates"))
+    return nullptr;
+
+  double total_out[6], right_out[6], left_out[6], tail_out[6];
+  probe_fin_wrench_with_joint_rates_arrays(state, fp_arr, joint_angles,
+                                           joint_rates, total_out, right_out,
+                                           left_out, tail_out);
+
+  PyObject *total_list = build_fixed_list(total_out, 6);
+  PyObject *right_list = build_fixed_list(right_out, 6);
+  PyObject *left_list = build_fixed_list(left_out, 6);
+  PyObject *tail_list = build_fixed_list(tail_out, 6);
+  if (total_list == nullptr || right_list == nullptr || left_list == nullptr ||
+      tail_list == nullptr) {
+    Py_XDECREF(total_list);
+    Py_XDECREF(right_list);
+    Py_XDECREF(left_list);
+    Py_XDECREF(tail_list);
+    return nullptr;
+  }
+
+  PyObject *result =
+      Py_BuildValue("(OOOO)", total_list, right_list, left_list, tail_list);
+  Py_DECREF(total_list);
+  Py_DECREF(right_list);
+  Py_DECREF(left_list);
+  Py_DECREF(tail_list);
+  return result;
+}
+
+static PyObject *py_step_with_body_wrench(PyObject *self, PyObject *args) {
+  (void)self;
+
+  PyObject *fish_state_obj = nullptr;
+  PyObject *body_params_obj = nullptr;
+  PyObject *body_wrench_obj = nullptr;
+  PyObject *hist_obj = nullptr;
+  double dt_total;
+
+  if (!PyArg_ParseTuple(args, "OOdOO", &fish_state_obj, &body_params_obj,
+                        &dt_total, &body_wrench_obj, &hist_obj)) {
+    return nullptr;
+  }
+
+  double state[NX];
+  if (!load_double_sequence(fish_state_obj, NX, state, "fish_state"))
+    return nullptr;
+
+  double bp_arr[36];
+  if (!load_double_sequence(body_params_obj, 36, bp_arr, "body_params"))
+    return nullptr;
+
+  double control_wrench[6];
+  if (!load_double_sequence(body_wrench_obj, 6, control_wrench, "body_wrench"))
+    return nullptr;
+
+  double hist_in[5];
+  if (!load_double_sequence(hist_obj, 5, hist_in, "hist"))
+    return nullptr;
+
+  if (dt_total < 0.0) {
+    PyErr_SetString(PyExc_ValueError, "dt must be non-negative");
+    return nullptr;
+  }
+
+  double hist_out[5];
+  simulate_step_with_body_wrench_arrays(state, bp_arr, dt_total, control_wrench,
+                                        hist_in, hist_out);
+
+  PyObject *state_out = build_state_list(state);
+  if (state_out == nullptr)
+    return nullptr;
+
+  PyObject *result =
+      Py_BuildValue("(Oddddd)", state_out, hist_out[0], hist_out[1], hist_out[2],
+                    hist_out[3], hist_out[4]);
+  Py_DECREF(state_out);
+  return result;
+}
+
+static PyObject *py_step_with_joint_rates(PyObject *self, PyObject *args) {
+  (void)self;
+
+  PyObject *fish_state_obj = nullptr;
+  PyObject *body_params_obj = nullptr;
+  PyObject *fin_params_obj = nullptr;
+  PyObject *joint_angles_obj = nullptr;
+  PyObject *joint_rates_obj = nullptr;
+  double dt_total;
+
+  if (!PyArg_ParseTuple(args, "OOOdOO", &fish_state_obj, &body_params_obj,
+                        &fin_params_obj, &dt_total, &joint_angles_obj,
+                        &joint_rates_obj)) {
+    return nullptr;
+  }
+
+  double state[NX];
+  if (!load_double_sequence(fish_state_obj, NX, state, "fish_state"))
+    return nullptr;
+
+  double bp_arr[36];
+  if (!load_double_sequence(body_params_obj, 36, bp_arr, "body_params"))
+    return nullptr;
+
+  double fp_arr[38];
+  if (!load_double_sequence(fin_params_obj, 38, fp_arr, "fin_params"))
+    return nullptr;
+
+  double joint_angles[5];
+  if (!load_double_sequence(joint_angles_obj, 5, joint_angles, "joint_angles"))
+    return nullptr;
+
+  double joint_rates[5];
+  if (!load_double_sequence(joint_rates_obj, 5, joint_rates, "joint_rates"))
+    return nullptr;
+
+  if (dt_total < 0.0) {
+    PyErr_SetString(PyExc_ValueError, "dt must be non-negative");
+    return nullptr;
+  }
+
+  double joint_angles_out[5];
+  simulate_step_with_joint_rates_arrays(state, bp_arr, fp_arr, dt_total,
+                                        joint_angles, joint_rates,
+                                        joint_angles_out);
+
+  PyObject *state_out = build_state_list(state);
+  PyObject *joint_angles_list = build_fixed_list(joint_angles_out, 5);
+  if (state_out == nullptr || joint_angles_list == nullptr) {
+    Py_XDECREF(state_out);
+    Py_XDECREF(joint_angles_list);
+    return nullptr;
+  }
+
+  PyObject *result = Py_BuildValue("(OO)", state_out, joint_angles_list);
+  Py_DECREF(state_out);
+  Py_DECREF(joint_angles_list);
+  return result;
+}
+
 static PyMethodDef module_methods[] = {
     {"update", py_update, METH_VARARGS,
      "Advance the 13-state fish dynamics model by one timestep."},
+    {"step_with_body_wrench", py_step_with_body_wrench, METH_VARARGS,
+     "Advance the 13-state fish dynamics model by one timestep using a direct 6D body wrench."},
+    {"probe_fin_wrenches", py_probe_fin_wrenches, METH_VARARGS,
+     "Evaluate the instantaneous fin wrench contributions without stepping the state."},
+    {"step_with_joint_rates", py_step_with_joint_rates, METH_VARARGS,
+     "Advance the 13-state fish dynamics model by one timestep using direct joint-angle rates."},
+    {"probe_fin_wrenches_with_joint_rates",
+     py_probe_fin_wrenches_with_joint_rates, METH_VARARGS,
+     "Evaluate the instantaneous fin wrench contributions using direct joint-angle rates."},
     {nullptr, nullptr, 0, nullptr}};
 
 static struct PyModuleDef module_def = {

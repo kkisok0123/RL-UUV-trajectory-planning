@@ -13,7 +13,12 @@ from rl.envs.geometry import (
     rotate_body_to_world,
     rotate_world_to_body,
 )
-from simulation.local_planning.fin_controller import fin_controller
+from simulation.local_planning.fin_controller import (
+    build_attitude_reference,
+    fin_controller,
+    run_layer1_controller,
+    run_layer2_controller,
+)
 
 
 class RLLocalPlanner:
@@ -119,9 +124,11 @@ class RLLocalPlanner:
         action = np.clip(np.asarray(action, dtype=np.float64).reshape(3), -1.0, 1.0)
         cmd_vel_body = action * self.action_velocity_limits
         cmd_vel_global = rotate_body_to_world(cmd_vel_body, self._rotation_body_to_world(fish_state))
+        ref_cmd = build_attitude_reference(cmd_vel_body, fish_state, controller_params)
         a1_ref, a2_ref, a3_ref, a4_ref, alpha5_ref, controller_state = fin_controller(
-            cmd_vel_global,
+            ref_cmd,
             fish_state,
+            hist,
             controller_state,
             dt,
             controller_params,
@@ -133,3 +140,56 @@ class RLLocalPlanner:
         )
         self.prev_action = action
         return action_ref, action, obs, cmd_vel_global, controller_state
+
+    def plan_layer1_wrench(
+        self,
+        fish_state: np.ndarray,
+        hist: np.ndarray,
+        local_target: np.ndarray,
+        visible_obstacles: list[dict],
+        controller_state: dict,
+        dt: float,
+        controller_params: dict,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
+        obs = self.build_observation(fish_state, hist, local_target, visible_obstacles)
+        action, _ = self.model.predict(obs, deterministic=True)
+        action = np.clip(np.asarray(action, dtype=np.float64).reshape(3), -1.0, 1.0)
+        cmd_vel_body = action * self.action_velocity_limits
+        cmd_vel_global = rotate_body_to_world(cmd_vel_body, self._rotation_body_to_world(fish_state))
+        ref_cmd = build_attitude_reference(cmd_vel_body, fish_state, controller_params)
+        tau_d, controller_state = run_layer1_controller(
+            ref_cmd,
+            fish_state,
+            controller_state,
+            dt,
+            controller_params,
+        )
+        self.prev_action = action
+        return tau_d, ref_cmd, action, obs, cmd_vel_global, controller_state
+
+    def plan_layer2_actuator(
+        self,
+        fish_state: np.ndarray,
+        hist: np.ndarray,
+        local_target: np.ndarray,
+        visible_obstacles: list[dict],
+        controller_state: dict,
+        dt: float,
+        controller_params: dict,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
+        obs = self.build_observation(fish_state, hist, local_target, visible_obstacles)
+        action, _ = self.model.predict(obs, deterministic=True)
+        action = np.clip(np.asarray(action, dtype=np.float64).reshape(3), -1.0, 1.0)
+        cmd_vel_body = action * self.action_velocity_limits
+        cmd_vel_global = rotate_body_to_world(cmd_vel_body, self._rotation_body_to_world(fish_state))
+        ref_cmd = build_attitude_reference(cmd_vel_body, fish_state, controller_params)
+        actuator_cmd, controller_state = run_layer2_controller(
+            ref_cmd,
+            fish_state,
+            hist,
+            controller_state,
+            dt,
+            controller_params,
+        )
+        self.prev_action = action
+        return actuator_cmd, ref_cmd, action, obs, cmd_vel_global, controller_state

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import sys
 from pathlib import Path
@@ -12,22 +13,27 @@ if __package__ in (None, ""):
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
+from dynamics_wrapper import probe_fin_wrenches as dynamics_probe_fin_wrenches
 from dynamics_wrapper import step as dynamics_step
+from dynamics_wrapper import step_with_body_wrench as dynamics_step_with_body_wrench
 from dynamics_wrapper.params import load_body_params, load_fin_params
 from dynamics_wrapper.indices import PX, PY, PZ, Q0, Q1, Q2, Q3
 from rl.local_planner import RLLocalPlanner
 from rl.configs.fish_env import build_fish_env_config
 from simulation.global_planning.los import los_guidance_3d
 from simulation.global_planning.plan_global_bezier_pso import planGlobalBezierPSO
-from simulation.local_planning.fin_controller import fin_controller
+from simulation.local_planning.fin_controller import (
+    run_layer1_controller,
+    run_layer2_controller,
+)
 from simulation.local_planning.path_utils import find_local_target
 from simulation.local_planning.sensor import get_visible_obstacles
 
 
 @dataclass
 class HybridSimulationConfig:
-    dt: float = 0.2
-    max_steps: int = 1000
+    dt: float = 0.25
+    max_steps: int = 10000
     goal_threshold: float = 1.0
     local_lookahead: float = 4.0
 
@@ -42,7 +48,20 @@ def _make_obstacle(center, radius, velocity=None) -> dict:
     }
 
 
-def run_hybrid_los_rl_simulation(model_path=None, visualize: bool = False) -> dict:
+def run_hybrid_los_rl_simulation(
+    model_path=None,
+    visualize: bool = False,
+    control_mode: str = "layer2",
+) -> dict:
+    mode_aliases = {
+        "full": "layer2",
+        "layer1_direct_wrench": "layer1",
+    }
+    control_mode = mode_aliases.get(control_mode, control_mode)
+    valid_modes = {"layer1", "layer2"}
+    if control_mode not in valid_modes:
+        raise ValueError(f"control_mode must be one of {sorted(valid_modes)}")
+
     cfg = HybridSimulationConfig()
     env_cfg = build_fish_env_config()
     sa_settings: dict[str, np.ndarray] = {}
@@ -91,25 +110,23 @@ def run_hybrid_los_rl_simulation(model_path=None, visualize: bool = False) -> di
     }
 
     fish_state = np.zeros(13, dtype=np.float64)
-    fish_state[:3] = fs["v"]
+    fish_state[:3] = [0,0,0]
     fish_state[Q0] = 1.0
     fish_state[[PX, PY, PZ]] = fs["p"]
     body_params = load_body_params()
     fin_params = load_fin_params()
 
-    ctrl_state = {"e_z_prev": 0.0, "e_psi_prev": 0.0}
-    hist = np.zeros(5, dtype=np.float64)
+    ctrl_state: dict = {}
+    hist = np.asarray(env_cfg["trim_refs"], dtype=np.float64).copy()
     c_A = 5.0
     fin_f = 4.0
     ref_min = np.asarray(env_cfg["ref_min"], dtype=np.float64)
     ref_max = np.asarray(env_cfg["ref_max"], dtype=np.float64)
-    fish_params = {
-        key: float(value) for key, value in env_cfg["controller_params"].items()
-    }
+    fish_controller_params = deepcopy(env_cfg["controller_params"])
 
     local_planner = RLLocalPlanner(model_path=model_path)
     curr_pos = fs["p"].copy()
-    robot_vel = fs["v"].copy()
+    robot_vel = [0,0,0]
     mode = "GLOBAL_TRACKING"
     current_path_idx = 1
     path_hist = [curr_pos.copy()]
@@ -124,8 +141,19 @@ def run_hybrid_los_rl_simulation(model_path=None, visualize: bool = False) -> di
     goal_threshold = cfg.goal_threshold
 
     sa_settings["cmd_vel_des"] = np.zeros((3, cfg.max_steps), dtype=np.float64)
+    sa_settings["wrench_cmd_des"] = np.zeros((6, cfg.max_steps), dtype=np.float64)
+    sa_settings["actuator_cmd_des"] = np.zeros((5, cfg.max_steps), dtype=np.float64)
+    sa_settings["fin_wrench_des_total"] = np.zeros((6, cfg.max_steps), dtype=np.float64)
+    sa_settings["fin_wrench_des_right"] = np.zeros((6, cfg.max_steps), dtype=np.float64)
+    sa_settings["fin_wrench_des_left"] = np.zeros((6, cfg.max_steps), dtype=np.float64)
+    sa_settings["fin_wrench_des_tail"] = np.zeros((6, cfg.max_steps), dtype=np.float64)
+    sa_settings["fin_wrench_real_total"] = np.zeros((6, cfg.max_steps), dtype=np.float64)
+    sa_settings["fin_wrench_real_right"] = np.zeros((6, cfg.max_steps), dtype=np.float64)
+    sa_settings["fin_wrench_real_left"] = np.zeros((6, cfg.max_steps), dtype=np.float64)
+    sa_settings["fin_wrench_real_tail"] = np.zeros((6, cfg.max_steps), dtype=np.float64)
     sa_settings["vel_act"] = np.zeros((3, cfg.max_steps), dtype=np.float64)
     sa_settings["mode"] = []
+    sa_settings["control_mode"] = control_mode
 
     for k in range(1, cfg.max_steps + 1):
         for obstacle in dyn_obs:
@@ -159,34 +187,47 @@ def run_hybrid_los_rl_simulation(model_path=None, visualize: bool = False) -> di
             d_min = float(np.min(safe_zone["dists"][safe_zone["is_blocked"]]))
 
         is_obs_in_danger = np.isfinite(d_min) and d_min < sensor_params["danger_distance"]
-        if mode == "GLOBAL_TRACKING" and is_obs_in_danger:
-            mode = "LOCAL_AVOIDANCE"
-            local_planner.reset()
-        elif mode == "LOCAL_AVOIDANCE" and not is_obs_in_danger:
-            mode = "GLOBAL_TRACKING"
+        # if mode == "GLOBAL_TRACKING" and is_obs_in_danger:
+        #     mode = "LOCAL_AVOIDANCE"
+        #     local_planner.reset()
+        # elif mode == "LOCAL_AVOIDANCE" and not is_obs_in_danger:
+        #     mode = "GLOBAL_TRACKING"
 
         sa_settings["mode"].append(mode)
         t_k = (k - 1) * cfg.dt
         los_target = np.full(3, np.nan, dtype=np.float64)
         local_target_log = np.full(3, np.nan, dtype=np.float64)
+        body_wrench_cmd = np.zeros(6, dtype=np.float64)
+        action_ref = np.zeros(5, dtype=np.float64)
 
         if mode == "LOCAL_AVOIDANCE":
             local_target = find_local_target(traj_global, curr_pos, cfg.local_lookahead)
             local_target_log = np.asarray(local_target, dtype=np.float64).copy()
-            action_ref, _, _, cmd_vel_global, ctrl_state = local_planner.plan(
-                fish_state,
-                hist,
-                local_target,
-                visible_obs,
-                ctrl_state,
-                cfg.dt,
-                fish_params,
-            )
+            if control_mode == "layer1":
+                body_wrench_cmd, _, _, _, cmd_vel_global, ctrl_state = local_planner.plan_layer1_wrench(
+                    fish_state,
+                    hist,
+                    local_target,
+                    visible_obs,
+                    ctrl_state,
+                    cfg.dt,
+                    fish_controller_params,
+                )
+            else:
+                action_ref, _, _, _, cmd_vel_global, ctrl_state = local_planner.plan_layer2_actuator(
+                    fish_state,
+                    hist,
+                    local_target,
+                    visible_obs,
+                    ctrl_state,
+                    cfg.dt,
+                    fish_controller_params,
+                )
             sa_settings["cmd_vel_des"][:, k - 1] = cmd_vel_global
             if np.isfinite(d_min):
-                title_hist.append(f"Step {k}: LOCAL AVOIDANCE (RL) - Visible Dist: {d_min:.2f}")
+                title_hist.append(f"Step {k}: LOCAL AVOIDANCE ({control_mode}) - Visible Dist: {d_min:.2f}")
             else:
-                title_hist.append(f"Step {k}: LOCAL AVOIDANCE (RL)")
+                title_hist.append(f"Step {k}: LOCAL AVOIDANCE ({control_mode})")
         else:
             lookback = max(1, current_path_idx - 10)
             _, _, psi_ref, theta_ref = los_guidance_3d(
@@ -205,11 +246,25 @@ def run_hybrid_los_rl_simulation(model_path=None, visualize: bool = False) -> di
                 ],
                 dtype=np.float64,
             )
+            ref_cmd = np.array([opts["vmax"], psi_ref, theta_ref], dtype=np.float64)
             sa_settings["cmd_vel_des"][:, k - 1] = cmd_vel_global
-            a1_ref, a2_ref, a3_ref, a4_ref, alpha5_ref, ctrl_state = fin_controller(
-                cmd_vel_global, fish_state, ctrl_state, cfg.dt, fish_params
-            )
-            action_ref = np.array([a1_ref, a2_ref, a3_ref, a4_ref, alpha5_ref], dtype=np.float64)
+            if control_mode == "layer1":
+                body_wrench_cmd, ctrl_state = run_layer1_controller(
+                    ref_cmd,
+                    fish_state,
+                    ctrl_state,
+                    cfg.dt,
+                    fish_controller_params,
+                )
+            else:
+                action_ref, ctrl_state = run_layer2_controller(
+                    ref_cmd,
+                    fish_state,
+                    hist,
+                    ctrl_state,
+                    cfg.dt,
+                    fish_controller_params,
+                )
             los_target = np.array(
                 [
                     nearest_p[0] + los_params["Delta"] * np.cos(theta_ref) * np.cos(psi_ref),
@@ -219,21 +274,52 @@ def run_hybrid_los_rl_simulation(model_path=None, visualize: bool = False) -> di
                 dtype=np.float64,
             )
             title_hist.append(
-                f"Step {k}: GLOBAL TRACKING (LOS) - {'No obstacles in FOV' if not np.isfinite(d_min) else f'Visible Dist: {d_min:.2f}'}"
+                f"Step {k}: GLOBAL TRACKING ({control_mode}) - {'No obstacles in FOV' if not np.isfinite(d_min) else f'Visible Dist: {d_min:.2f}'}"
             )
 
-        action_ref = np.clip(action_ref, ref_min, ref_max)
-        fish_state, hist = dynamics_step(
-            fish_state,
-            body_params,
-            fin_params,
-            cfg.dt,
-            t_k,
-            action_ref,
-            hist,
-            c_A,
-            fin_f,
-        )
+        if control_mode == "layer1":
+            sa_settings["wrench_cmd_des"][:, k - 1] = body_wrench_cmd
+            fish_state, hist = dynamics_step_with_body_wrench(
+                fish_state,
+                body_params,
+                cfg.dt,
+                body_wrench_cmd,
+                hist,
+            )
+        else:
+            action_ref = np.clip(np.asarray(action_ref, dtype=np.float64).reshape(5), ref_min, ref_max)
+            sa_settings["actuator_cmd_des"][:, k - 1] = action_ref
+            if "tau_target" in ctrl_state:
+                sa_settings["wrench_cmd_des"][:, k - 1] = np.asarray(ctrl_state["tau_target"], dtype=np.float64).reshape(6)
+                sa_settings["fin_wrench_des_total"][:, k - 1] = np.asarray(ctrl_state["tau_target"], dtype=np.float64).reshape(6)
+            if all(key in ctrl_state for key in ("w_r_des", "w_l_des", "w_t_des")):
+                sa_settings["fin_wrench_des_right"][:, k - 1] = np.asarray(ctrl_state["w_r_des"], dtype=np.float64).reshape(6)
+                sa_settings["fin_wrench_des_left"][:, k - 1] = np.asarray(ctrl_state["w_l_des"], dtype=np.float64).reshape(6)
+                sa_settings["fin_wrench_des_tail"][:, k - 1] = np.asarray(ctrl_state["w_t_des"], dtype=np.float64).reshape(6)
+            probed_fin_wrenches = dynamics_probe_fin_wrenches(
+                fish_state,
+                fin_params,
+                t_k,
+                action_ref,
+                hist,
+                c_A,
+                fin_f,
+            )
+            sa_settings["fin_wrench_real_total"][:, k - 1] = probed_fin_wrenches["total"]
+            sa_settings["fin_wrench_real_right"][:, k - 1] = probed_fin_wrenches["right"]
+            sa_settings["fin_wrench_real_left"][:, k - 1] = probed_fin_wrenches["left"]
+            sa_settings["fin_wrench_real_tail"][:, k - 1] = probed_fin_wrenches["tail"]
+            fish_state, hist = dynamics_step(
+                fish_state,
+                body_params,
+                fin_params,
+                cfg.dt,
+                t_k,
+                action_ref,
+                hist,
+                c_A,
+                fin_f,
+            )
         if not np.isfinite(fish_state).all():
             numerical_issue = True
             blocked_pts_hist.append(blocked_pts)
@@ -278,6 +364,7 @@ def run_hybrid_los_rl_simulation(model_path=None, visualize: bool = False) -> di
         "danger_dist_hist": np.asarray(danger_dist_hist, dtype=np.float64),
         "settings": sa_settings,
         "steps_executed": steps_executed,
+        "dt": cfg.dt,
         "sensor_params": sensor_params,
         "initial_robot_vel": fs["v"].copy(),
         "reached_goal": reached_goal,
@@ -294,7 +381,7 @@ def run_hybrid_los_rl_simulation(model_path=None, visualize: bool = False) -> di
 
 
 def main() -> None:
-    result = run_hybrid_los_rl_simulation(visualize=True)
+    result = run_hybrid_los_rl_simulation(visualize=True, control_mode="layer2")
     print("reached_goal:", result["reached_goal"])
     print("path_len:", len(result["path_hist"]))
 

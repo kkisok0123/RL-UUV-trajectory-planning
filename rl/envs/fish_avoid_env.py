@@ -14,7 +14,6 @@ from rl.configs.fish_env import build_fish_env_config
 from rl.envs.geometry import (
     nearest_obstacle_info,
     quaternion_to_rotation_matrix,
-    quaternion_from_yaw,
     rotate_body_to_world,
     rotate_world_to_body,
     vector_angle,
@@ -39,6 +38,17 @@ class FishAvoidEnv(gym.Env):
         self.body_params = np.asarray(self.cfg["body_params"], dtype=np.float64)
         self.fin_params = np.asarray(self.cfg["fin_params"], dtype=np.float64)
         validate_params(self.body_params, self.fin_params)
+        self.initial_state_template = np.asarray(
+            self.cfg.get(
+                "initial_state_template",
+                np.array([0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            ),
+            dtype=np.float64,
+        )
+        if self.initial_state_template.shape != (STATE_DIM,):
+            raise ValueError(
+                f"initial_state_template must have shape ({STATE_DIM},), got {self.initial_state_template.shape}"
+            )
 
         self.trim_refs = np.asarray(self.cfg["trim_refs"], dtype=np.float64)
         self.ref_min = np.asarray(self.cfg["ref_min"], dtype=np.float64)
@@ -228,11 +238,7 @@ class FishAvoidEnv(gym.Env):
         }
 
         start_xyz = self.np_random.uniform(spawn["start_xyz_low"], spawn["start_xyz_high"]).astype(np.float64)
-        yaw0 = float(self.np_random.uniform(-np.pi, np.pi))
-        quat = quaternion_from_yaw(yaw0)
-
-        self.state = np.zeros(STATE_DIM, dtype=np.float64)
-        self.state[Q0 : Q3 + 1] = quat
+        self.state = self.initial_state_template.copy()
         self.state[[PX, PY, PZ]] = start_xyz
 
         self.goal_xyz = self._sample_goal()

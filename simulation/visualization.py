@@ -99,6 +99,42 @@ def _axis_limits_from_points(
     return centers - half_spans, centers + half_spans
 
 
+def _set_3d_axis_scale(
+    ax,
+    axis_mins: np.ndarray,
+    axis_maxs: np.ndarray,
+) -> None:
+    axis_mins = np.asarray(axis_mins, dtype=np.float64).reshape(3)
+    axis_maxs = np.asarray(axis_maxs, dtype=np.float64).reshape(3)
+    axis_spans = np.maximum(axis_maxs - axis_mins, 1.0)
+    axis_centers = 0.5 * (axis_mins + axis_maxs)
+    max_half_span = 0.5 * float(np.max(axis_spans))
+
+    ax.set_xlim(float(axis_centers[0] - max_half_span), float(axis_centers[0] + max_half_span))
+    ax.set_ylim(float(axis_centers[1] - max_half_span), float(axis_centers[1] + max_half_span))
+    ax.set_zlim(float(axis_centers[2] - max_half_span), float(axis_centers[2] + max_half_span))
+    try:
+        ax.set_box_aspect((1.0, 1.0, 1.0))
+    except AttributeError:
+        pass
+
+
+def _unwrap_angle_series(angle_series: np.ndarray) -> np.ndarray:
+    angle_series = np.asarray(angle_series, dtype=np.float64).copy()
+    if angle_series.ndim != 1 or angle_series.size == 0:
+        return angle_series
+
+    finite_mask = np.isfinite(angle_series)
+    if not np.any(finite_mask):
+        return angle_series
+
+    finite_indices = np.flatnonzero(finite_mask)
+    split_points = np.where(np.diff(finite_indices) > 1)[0] + 1
+    for run_indices in np.split(finite_indices, split_points):
+        angle_series[run_indices] = np.unwrap(angle_series[run_indices])
+    return angle_series
+
+
 def plot_hybrid_result(result: dict, static_obs: list[dict], dyn_obs: list[dict], goal: np.ndarray) -> None:
     del dyn_obs
 
@@ -162,8 +198,6 @@ def plot_hybrid_result(result: dict, static_obs: list[dict], dyn_obs: list[dict]
             bounds_points.append(dyn_obs_hist[:, obs_idx, :] - radius)
             bounds_points.append(dyn_obs_hist[:, obs_idx, :] + radius)
     axis_mins, axis_maxs = _axis_limits_from_points(bounds_points)
-    axis_spans = np.maximum(axis_maxs - axis_mins, 1.0)
-
     fig = plt.figure(
         figsize=(12, 10),
         facecolor="white",
@@ -173,15 +207,9 @@ def plot_hybrid_result(result: dict, static_obs: list[dict], dyn_obs: list[dict]
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
     ax.set_zlabel("Z (m)")
-    ax.set_xlim(float(axis_mins[0]), float(axis_maxs[0]))
-    ax.set_ylim(float(axis_mins[1]), float(axis_maxs[1]))
-    ax.set_zlim(float(axis_mins[2]), float(axis_maxs[2]))
+    _set_3d_axis_scale(ax, axis_mins, axis_maxs)
     ax.view_init(elev=30.0, azim=-37.5)
     ax.grid(True)
-    try:
-        ax.set_box_aspect(tuple(axis_spans))
-    except AttributeError:
-        pass
 
     ax.plot(
         traj_global[:, 0],
@@ -457,6 +485,8 @@ def plot_hybrid_result(result: dict, static_obs: list[dict], dyn_obs: list[dict]
         t_axis = np.arange(steps_executed, dtype=np.float64) * float(sensor_params.get("dt", 0.2))
         fig_att, axes_att = plt.subplots(4, 1, figsize=(11, 9), sharex=True, facecolor="white")
         fig_att.suptitle("Attitude Tracking Performance")
+        psi_ref_plot = _unwrap_angle_series(psi_ref[:steps_executed])
+        psi_act_plot = _unwrap_angle_series(psi_act[:steps_executed])
 
         axes_att[0].plot(t_axis, np.rad2deg(theta_ref[:steps_executed]), "r--", linewidth=1.5, label="theta_ref")
         axes_att[0].plot(t_axis, np.rad2deg(theta_act[:steps_executed]), "b-", linewidth=1.0, label="theta")
@@ -464,8 +494,8 @@ def plot_hybrid_result(result: dict, static_obs: list[dict], dyn_obs: list[dict]
         axes_att[0].grid(True)
         axes_att[0].legend(loc="best")
 
-        axes_att[1].plot(t_axis, np.rad2deg(psi_ref[:steps_executed]), "r--", linewidth=1.5, label="psi_ref")
-        axes_att[1].plot(t_axis, np.rad2deg(psi_act[:steps_executed]), "b-", linewidth=1.0, label="psi")
+        axes_att[1].plot(t_axis, np.rad2deg(psi_ref_plot), "r--", linewidth=1.5, label="psi_ref")
+        axes_att[1].plot(t_axis, np.rad2deg(psi_act_plot), "b-", linewidth=1.0, label="psi")
         axes_att[1].set_ylabel("Yaw (deg)")
         axes_att[1].grid(True)
         axes_att[1].legend(loc="best")

@@ -19,6 +19,7 @@ from dynamics_wrapper.params import load_body_params, load_fin_params
 from rl.configs.fish_env import build_fish_env_config
 from simulation.global_planning.los import los_guidance_3d
 from simulation.local_planning.fin_controller import fin_controller
+from simulation.visualization import _axis_limits_from_points, _set_3d_axis_scale
 
 
 @dataclass
@@ -118,7 +119,10 @@ def build_complex_tracking_path(samples_per_segment: int = 60) -> dict:
             [24.0, 3.6, 0.5],
             [30.0, -2.8, 1.0],
             [36.0, 1.8, -1.1],
-            [42.0, 0.0, 0.0],
+            [42.0, 4.3, 2.0],
+            [48.0, 3.7, 4.2],
+            [54.0, 1.4, 1.4],
+            [60.0, 0.0, 0.0]
         ],
         dtype=np.float64,
     )
@@ -611,6 +615,17 @@ def _plot_los_fin_tracking_result(result: dict, save_path: str | None, show: boo
     ax3d.set_xlabel("X [m]")
     ax3d.set_ylabel("Y [m]")
     ax3d.set_zlabel("Z [m]")
+    axis_mins, axis_maxs = _axis_limits_from_points(
+        [
+            np.asarray(traj_xyz, dtype=np.float64),
+            np.asarray(waypoints, dtype=np.float64),
+            np.asarray(path_hist, dtype=np.float64),
+            np.asarray(proj_hist, dtype=np.float64),
+            np.asarray(los_target_hist, dtype=np.float64),
+        ]
+    )
+    _set_3d_axis_scale(ax3d, axis_mins, axis_maxs)
+    ax3d.view_init(elev=28.0, azim=-55.0)
     ax3d.legend(loc="best")
 
     ax_err = fig.add_subplot(222)

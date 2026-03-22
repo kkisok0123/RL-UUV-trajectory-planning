@@ -9,6 +9,10 @@ def build_fish_env_config() -> dict:
     trim_refs = np.deg2rad(np.array([30.0, 15.0, 30.0, 15.0, 0.0], dtype=np.float64))
     ref_min = np.deg2rad(np.array([0.0, 0.0, 0.0, 0.0, -45.0], dtype=np.float64))
     ref_max = np.deg2rad(np.array([45.0, 30.0, 45.0, 30.0, 45.0], dtype=np.float64))
+    initial_state_template = np.array(
+        [0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        dtype=np.float64,
+    )
     return {
         "dt": 0.20,
         "c_A": 5.0,
@@ -20,17 +24,18 @@ def build_fish_env_config() -> dict:
         "obs_clip": 50.0,
         "body_params": load_body_params(),
         "fin_params": load_fin_params(),
+        "initial_state_template": initial_state_template,
         "trim_refs": trim_refs,
         "ref_min": ref_min,
         "ref_max": ref_max,
         "action_velocity_limits": np.array([0.60, 0.35, 0.30], dtype=np.float64),
         "controller_params": {
-            "Kp_z": 1.2,
+            "Kp_z": -1.2,
             "Ki_z": 0,
-            "Kd_z": 6.0,
-            "Kp_psi": -1.5,
+            "Kd_z": -6.0,
+            "Kp_psi": 1.5,
             "Ki_psi": 0,
-            "Kd_psi": -6.0,
+            "Kd_psi": 6.0,
             "A_base": np.deg2rad(45.0),
             "A_rot_base": np.deg2rad(15.0),
             "alpha5_min": np.deg2rad(-45.0),

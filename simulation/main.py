@@ -18,7 +18,7 @@ from dynamics_wrapper.indices import PX, PY, PZ, Q0, Q1, Q2, Q3
 from rl.local_planner import RLLocalPlanner
 from rl.configs.fish_env import build_fish_env_config
 from simulation.global_planning.los import los_guidance_3d
-from simulation.global_planning.plan_global_bezier_pso import planGlobalBezierPSO
+# from simulation.global_planning.plan_global_bezier_pso import planGlobalBezierPSO
 from simulation.local_planning.fin_controller import fin_controller
 from simulation.local_planning.path_utils import find_local_target
 from simulation.local_planning.sensor import get_visible_obstacles
@@ -26,8 +26,8 @@ from simulation.local_planning.sensor import get_visible_obstacles
 
 @dataclass
 class HybridSimulationConfig:
-    dt: float = 0.2
-    max_steps: int = 1000
+    dt: float = 0.1
+    max_steps: int = 2500
     goal_threshold: float = 1.0
     local_lookahead: float = 4.0
 
@@ -59,6 +59,45 @@ def _quat_from_forward_vector(forward_world: np.ndarray) -> np.ndarray:
     return quat / np.linalg.norm(quat)
 
 
+def _catmull_rom_chain(waypoints: np.ndarray, samples_per_segment: int) -> np.ndarray:
+    pts = np.asarray(waypoints, dtype=np.float64)
+    tangents = np.zeros_like(pts)
+    tangents[0] = 0.5 * (pts[1] - pts[0])
+    tangents[-1] = 0.5 * (pts[-1] - pts[-2])
+    tangents[1:-1] = 0.5 * (pts[2:] - pts[:-2])
+
+    samples: list[np.ndarray] = []
+    for idx in range(len(pts) - 1):
+        p0 = pts[idx]
+        p1 = pts[idx + 1]
+        m0 = tangents[idx]
+        m1 = tangents[idx + 1]
+        for tau in np.linspace(0.0, 1.0, samples_per_segment, endpoint=False):
+            h00 = 2.0 * tau**3 - 3.0 * tau**2 + 1.0
+            h10 = tau**3 - 2.0 * tau**2 + tau
+            h01 = -2.0 * tau**3 + 3.0 * tau**2
+            h11 = tau**3 - tau**2
+            samples.append(h00 * p0 + h10 * m0 + h01 * p1 + h11 * m1)
+    samples.append(pts[-1].copy())
+    return np.asarray(samples, dtype=np.float64)
+
+
+def _path_tangent(path_xyz: np.ndarray, index: int) -> np.ndarray:
+    path_xyz = np.asarray(path_xyz, dtype=np.float64)
+    idx = int(np.clip(index, 0, path_xyz.shape[0] - 1))
+    if path_xyz.shape[0] < 2:
+        return np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    if idx == 0:
+        tangent = path_xyz[1] - path_xyz[0]
+    elif idx == path_xyz.shape[0] - 1:
+        tangent = path_xyz[-1] - path_xyz[-2]
+    else:
+        tangent = 0.5 * (path_xyz[idx + 1] - path_xyz[idx - 1])
+    if np.linalg.norm(tangent) < 1e-8:
+        tangent = path_xyz[min(idx + 1, path_xyz.shape[0] - 1)] - path_xyz[max(idx - 1, 0)]
+    return np.asarray(tangent, dtype=np.float64)
+
+
 def _compute_tracking_metrics(settings: dict, controller_params: dict, steps_executed: int) -> dict:
     if steps_executed <= 0:
         return {}
@@ -86,6 +125,32 @@ def _compute_tracking_metrics(settings: dict, controller_params: dict, steps_exe
     }
 
 
+def _build_reference_path_from_tracking_template(start: np.ndarray, goal: np.ndarray) -> dict:
+    start = np.asarray(start, dtype=np.float64).reshape(3)
+    goal = np.asarray(goal, dtype=np.float64).reshape(3)
+    # Use explicit world-frame waypoints so the nominal route stays clear of the
+    # current obstacle chain while preserving a steady climb toward the goal.
+    waypoints = np.array(
+        [
+            start,
+            [8.0, -36.0, -55.0],
+            [16.0, -32.0, -49.0],
+            [24.0, -27.0, -41.0],
+            [32.0, -20.0, -32.0],
+            [40.0, -10.0, -22.0],
+            [48.0, 0.0, -12.0],
+            [56.0, 12.0, -2.0],
+            [64.0, 24.0, 8.0],
+            [70.0, 36.0, 14.0],
+            [75.0, 48.0, 18.0],
+            goal,
+        ],
+        dtype=np.float64,
+    )
+    xyz = _catmull_rom_chain(waypoints, samples_per_segment=80)
+    return {"waypoints": waypoints, "xyz": xyz}
+
+
 def run_hybrid_los_rl_simulation(
     model_path=None,
     visualize: bool = False,
@@ -95,52 +160,66 @@ def run_hybrid_los_rl_simulation(
     env_cfg = build_fish_env_config()
     sa_settings: dict[str, np.ndarray] = {}
 
-    fs = {"p": np.array([0.0, 0.0, 0.0]), "v": np.array([1.0, 3.0, 2.0]), "a": np.zeros(3)}
-    fg = {"p": np.array([15.0, 15.0, 2.0]), "v": np.zeros(3), "a": np.zeros(3)}
+    fs = {"p": np.array([0.0, -40.0, -60.0]), "v": np.array([1.2, 1.5, 1.2]), "a": np.zeros(3)}
+    fg = {"p": np.array([80.0, 60.0, 20.0]), "v": np.zeros(3), "a": np.zeros(3)}
+    scene_min = np.array([0.0, -40.0, -60.0], dtype=np.float64)
+    scene_max = np.array([80.0, 60.0, 20.0], dtype=np.float64)
 
-    opts = {
-        "t0": 0.0,
-        "t3": 15.0,
-        "vmax": 0.6,
-        "amax": 1.5,
-        "N": 300,
-        "psoM": 200,
-        "psoT": 400,
-        "w": 0.7,
-        "c1": 1.6,
-        "c2": 1.6,
-        "clearance": 0.2,
-        "Mk_obs": 1e3,
-        "Mk_speed": 1e2,
-        "Mk_acc": 1e2,
-        "Mk_kappa": 1e2,
-        "dt": cfg.dt,
-    }
+    cruise_speed = 1.2
+    # opts = {
+    #     "t0": 0.0,
+    #     "t3": 60.0,
+    #     "vmax": 1.2,
+    #     "amax": 1.5,
+    #     "N": 500,
+    #     "psoM": 200,
+    #     "psoT": 400,
+    #     "w": 0.7,
+    #     "c1": 1.6,
+    #     "c2": 1.6,
+    #     "clearance": 0.2,
+    #     "Mk_obs": 1e3,
+    #     "Mk_speed": 1e2,
+    #     "Mk_acc": 1e2,
+    #     "Mk_kappa": 1e2,
+    #     "dt": cfg.dt,
+    # }
 
     los_params = {"Delta": 2.5, "k_p": 0.5}
     static_obs = [
-        _make_obstacle([5.0, 5.0, 0.0], 1.6),
-        _make_obstacle([12.0, 13.0, 1.0], 1.5),
+        _make_obstacle([16.0, -22.0, -44.0], 4.2),
+        _make_obstacle([28.0, -6.0, -30.0], 5.0),
+        _make_obstacle([42.0, 10.0, -12.0], 4.8),
+        _make_obstacle([58.0, 28.0, 2.0], 5.4),
+        _make_obstacle([68.0, 44.0, 12.0], 4.6),
     ]
-    dyn_obs = [_make_obstacle([12.0, 2.0, 0.5], 1.5, [-0.5, 0.6, 0.3])]
+    dyn_obs = [
+        _make_obstacle([24.0, -28.0, -38.0], 3.6, [0.35, 0.55, 0.22]),
+        _make_obstacle([46.0, 8.0, -8.0], 3.9, [-0.40, 0.32, 0.18]),
+        _make_obstacle([62.0, 34.0, 8.0], 3.5, [0.28, -0.36, -0.14]),
+    ]
 
-    traj_global = planGlobalBezierPSO(fs, fg, opts, static_obs + dyn_obs)
+    # traj_global = planGlobalBezierPSO(fs, fg, opts, static_obs + dyn_obs)
+    traj_global = _build_reference_path_from_tracking_template(fs["p"], fg["p"])
     s_max = traj_global["xyz"].shape[0]
-    fx = lambda s: np.interp(s, np.arange(1, s_max + 1), traj_global["xyz"][:, 0])
-    fy = lambda s: np.interp(s, np.arange(1, s_max + 1), traj_global["xyz"][:, 1])
-    fz = lambda s: np.interp(s, np.arange(1, s_max + 1), traj_global["xyz"][:, 2])
+    s_grid = np.arange(1, s_max + 1, dtype=np.float64)
+    fx = lambda s: np.interp(s, s_grid, traj_global["xyz"][:, 0])
+    fy = lambda s: np.interp(s, s_grid, traj_global["xyz"][:, 1])
+    fz = lambda s: np.interp(s, s_grid, traj_global["xyz"][:, 2])
 
     sensor_params = {
-        "range": 5.0,
+        "range": 12.0,
         "fov_angle": 45.0,
-        "danger_distance": 3.0,
+        "danger_distance": 6.0,
         "dt": cfg.dt,
         "num_rays": 100,
     }
 
     fish_state = np.zeros(13, dtype=np.float64)
-    fish_state[:3] = [0,0,0]
-    fish_state[Q0 : Q3 + 1] = _quat_from_forward_vector(fs["v"])
+    initial_tangent = _path_tangent(traj_global["xyz"], 0)
+    initial_tangent = initial_tangent / max(np.linalg.norm(initial_tangent), 1e-8)
+    fish_state[:3] = np.array([max(cruise_speed, 0.6), 0.0, 0.0], dtype=np.float64)
+    fish_state[Q0 : Q3 + 1] = _quat_from_forward_vector(initial_tangent)
     fish_state[[PX, PY, PZ]] = fs["p"]
     body_params = load_body_params()
     fin_params = load_fin_params()
@@ -196,11 +275,15 @@ def run_hybrid_los_rl_simulation(
     for k in range(1, cfg.max_steps + 1):
         for obstacle in dyn_obs:
             obstacle["c"] = obstacle["c"] + obstacle["v"] * cfg.dt
-            bounds = (0.0, 15.0)
-            if obstacle["c"][0] < bounds[0] or obstacle["c"][0] > bounds[1]:
+            if obstacle["c"][0] < scene_min[0] or obstacle["c"][0] > scene_max[0]:
                 obstacle["v"][0] = -obstacle["v"][0]
-            if obstacle["c"][1] < bounds[0] or obstacle["c"][1] > bounds[1]:
+                obstacle["c"][0] = np.clip(obstacle["c"][0], scene_min[0], scene_max[0])
+            if obstacle["c"][1] < scene_min[1] or obstacle["c"][1] > scene_max[1]:
                 obstacle["v"][1] = -obstacle["v"][1]
+                obstacle["c"][1] = np.clip(obstacle["c"][1], scene_min[1], scene_max[1])
+            if obstacle["c"][2] < scene_min[2] or obstacle["c"][2] > scene_max[2]:
+                obstacle["v"][2] = -obstacle["v"][2]
+                obstacle["c"][2] = np.clip(obstacle["c"][2], scene_min[2], scene_max[2])
 
         all_true_obs = static_obs + dyn_obs
         safe_zone = get_visible_obstacles(curr_pos, robot_vel, all_true_obs, sensor_params)
@@ -265,9 +348,9 @@ def run_hybrid_los_rl_simulation(
 
             cmd_vel_global = np.array(
                 [
-                    opts["vmax"] * np.cos(theta_ref) * np.cos(psi_ref),
-                    opts["vmax"] * np.cos(theta_ref) * np.sin(psi_ref),
-                    -opts["vmax"] * np.sin(theta_ref),
+                    cruise_speed * np.cos(theta_ref) * np.cos(psi_ref),
+                    cruise_speed * np.cos(theta_ref) * np.sin(psi_ref),
+                    -cruise_speed * np.sin(theta_ref),
                 ],
                 dtype=np.float64,
             )

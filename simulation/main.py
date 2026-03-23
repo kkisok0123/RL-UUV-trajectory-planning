@@ -393,6 +393,8 @@ def _run_hybrid_los_local_simulation(
     sa_settings["psi_int"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
     sa_settings["alpha5_ref"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
     sa_settings["delta_ref"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["mpc_cmd_speed"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["mpc_risk_max"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
     sa_settings["mode"] = []
     sa_settings["local_planner_success"] = []
 
@@ -438,6 +440,8 @@ def _run_hybrid_los_local_simulation(
         local_target_log = np.full(3, np.nan, dtype=np.float64)
         controller_snapshot: dict | None = None
         local_success = True
+        mpc_cmd_speed = np.nan
+        mpc_risk_max = np.nan
 
         if mode == "LOCAL_AVOIDANCE":
             local_target = find_local_target(traj_global, curr_pos, cfg.local_lookahead)
@@ -454,7 +458,7 @@ def _run_hybrid_los_local_simulation(
                 )
                 controller_snapshot = ctrl_state
             else:
-                attitude_ref, planner_info = local_planner.plan(
+                attitude_ref, cmd_speed_ref, planner_info = local_planner.plan(
                     fish_state,
                     hist,
                     local_target,
@@ -464,11 +468,13 @@ def _run_hybrid_los_local_simulation(
                 psi_ref = float(attitude_ref[0])
                 theta_ref = float(attitude_ref[1])
                 cmd_vel_global = np.asarray(planner_info.get("cmd_vel_global", np.zeros(3)), dtype=np.float64).reshape(3)
+                mpc_cmd_speed = float(planner_info.get("cmd_speed_ref", cmd_speed_ref))
+                mpc_risk_max = float(planner_info.get("risk_max", np.nan))
                 local_success = bool(planner_info.get("success", False))
                 a1_ref, a2_ref, a3_ref, a4_ref, alpha5_ref, ctrl_state = fin_controller(
                     psi_ref,
                     theta_ref,
-                    cmd_speed,
+                    cmd_speed_ref,
                     fish_state,
                     ctrl_state,
                     cfg.dt,
@@ -531,6 +537,8 @@ def _run_hybrid_los_local_simulation(
             )
 
         sa_settings["local_planner_success"].append(local_success)
+        sa_settings["mpc_cmd_speed"][k - 1] = mpc_cmd_speed
+        sa_settings["mpc_risk_max"][k - 1] = mpc_risk_max
         _append_controller_snapshot(sa_settings, k - 1, controller_snapshot)
 
         action_ref = np.clip(action_ref, ref_min, ref_max)

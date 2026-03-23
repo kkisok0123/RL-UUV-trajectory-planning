@@ -39,6 +39,11 @@ def velocity_to_attitude_refs(cmd_vel: np.ndarray, current_state: np.ndarray) ->
     return float(psi_ref), float(theta_ref), float(speed_des)
 
 
+def _smoothstep01(value: float) -> float:
+    value = float(np.clip(value, 0.0, 1.0))
+    return value * value * (3.0 - 2.0 * value)
+
+
 def fin_controller(
     psi_ref: float,
     theta_ref: float,
@@ -88,14 +93,18 @@ def fin_controller(
     a2_ref = params["A_rot_base"] - delta_ref
     a4_ref = params["A_rot_base"] + delta_ref
 
-    v_max_expected = 0.4
-    scaling_factor = min(cmd_speed / (0.5 * v_max_expected), 2.5)
-    if cmd_speed < 0.05:
-        a1_ref = 0.0
-        a3_ref = 0.0
+    a_min = float(params.get("A_min", 0.0))
+    a_max = float(params.get("A_max", params["A_base"]))
+    speed_sched_min = float(params.get("speed_sched_min", 0.04))
+    speed_sched_max = float(params.get("speed_sched_max", 0.30))
+    if speed_sched_max <= speed_sched_min + 1e-9:
+        a_prop = a_max if cmd_speed >= speed_sched_max else a_min
     else:
-        a1_ref = params["A_base"] * scaling_factor
-        a3_ref = params["A_base"] * scaling_factor
+        sched = (cmd_speed - speed_sched_min) / (speed_sched_max - speed_sched_min)
+        a_prop = a_min + _smoothstep01(sched) * (a_max - a_min)
+    a_prop = float(np.clip(a_prop, min(a_min, a_max), max(a_min, a_max)))
+    a1_ref = a_prop
+    a3_ref = a_prop
 
     controller_state["theta_ref"] = theta_ref
     controller_state["theta"] = theta
@@ -106,6 +115,7 @@ def fin_controller(
     controller_state["alpha5_ref"] = alpha5_ref
     controller_state["delta_ref"] = delta_ref
     controller_state["cmd_speed"] = cmd_speed
+    controller_state["a_prop_ref"] = a_prop
 
     fin_output_history = controller_state.setdefault("fin_output_history", [])
     fin_output = {

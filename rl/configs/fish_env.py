@@ -30,15 +30,15 @@ def build_fish_env_config() -> dict:
         "ref_max": ref_max,
         "action_velocity_limits": np.array([0.60, 0.35, 0.30], dtype=np.float64),
         "mpc": {
-            "N": 14,
+            "N": 15,
             "max_obstacles": 10,
-            "obstacle_margin": 5,
+            "obstacle_margin": 4,
             "collision_margin": 2,
             "heading_tau": 0.2,
             "max_theta_ref": np.deg2rad(60.0),
             "W_goal": 10.0,
             "W_terminal": 2.0,
-            "W_obs": 3500.0,
+            "W_obs": 2000.0,
             "W_collision": 25000.0,
         },
         "controller_params": {

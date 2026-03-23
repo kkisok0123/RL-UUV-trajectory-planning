@@ -15,6 +15,7 @@ if __package__ in (None, ""):
 from dynamics_wrapper import step as dynamics_step
 from dynamics_wrapper.indices import PX, PY, PZ, Q0, Q1, Q2, Q3
 from rl.configs.fish_env import build_fish_env_config
+from rl.envs.geometry import nearest_obstacle_info
 from rl.local_planner import RLLocalPlanner
 from simulation.global_planning.los import los_guidance_3d
 from simulation.local_planning.fin_controller import fin_controller
@@ -312,7 +313,7 @@ def _run_hybrid_los_local_simulation(
             anchor=[31.5, 1.20, 0.55],
             radius=2.5,
             amplitude=[2, 4, 1.5],
-            frequency=[0.2, 0.35, 0.20],
+            frequency=[0.12, 0.22, 0.12],
             phase=[0.20, 1.05, -0.35],
         ),
     ]
@@ -324,7 +325,7 @@ def _run_hybrid_los_local_simulation(
     fz = lambda s: np.interp(s, s_grid, traj_global["xyz"][:, 2])
 
     sensor_params = {
-        "range": 8.0,
+        "range": 8,
         "fov_angle": 60,
         "danger_distance_enter": 6.0,
         "danger_distance_exit": 4.0,
@@ -348,6 +349,7 @@ def _run_hybrid_los_local_simulation(
     hist = np.zeros(5, dtype=np.float64)
     c_a = float(env_cfg["c_A"])
     fin_f = float(env_cfg["fin_f"])
+    fish_radius = float(env_cfg["fish_radius"])
     ref_min = np.asarray(env_cfg["ref_min"], dtype=np.float64)
     ref_max = np.asarray(env_cfg["ref_max"], dtype=np.float64)
     fish_params = {key: float(value) for key, value in env_cfg["controller_params"].items()}
@@ -374,7 +376,9 @@ def _run_hybrid_los_local_simulation(
     title_hist = ["Starting Simulation with LOS Guidance..."]
     danger_dist_hist = [np.nan]
     reached_goal = False
+    collided = False
     numerical_issue = False
+    collision_info: dict | None = None
     goal_threshold = cfg.goal_threshold
 
     sa_settings["cmd_vel_des"] = np.zeros((3, cfg.max_steps), dtype=np.float64)
@@ -560,6 +564,24 @@ def _run_hybrid_los_local_simulation(
         local_target_hist.append(local_target_log)
         danger_dist_hist.append(d_min if np.isfinite(d_min) else np.nan)
 
+        nearest_obstacle = nearest_obstacle_info(curr_pos, robot_vel, all_true_obs, fish_radius)
+        collision_clearance = float(nearest_obstacle["clearance"])
+        if collision_clearance <= 0.0:
+            collided = True
+            collision_info = {
+                "step": k,
+                "clearance": collision_clearance,
+                "position": curr_pos.copy(),
+                "obstacle_center": np.asarray(nearest_obstacle["c"], dtype=np.float64).copy(),
+                "obstacle_radius": float(nearest_obstacle["r"]),
+                "fish_radius": fish_radius,
+                "distance": float(nearest_obstacle["distance"]),
+            }
+            title_hist[-1] = (
+                f"Step {k}: COLLISION - clearance {collision_clearance:.3f} m"
+            )
+            break
+
         if np.linalg.norm(curr_pos - fg["p"]) < goal_threshold:
             reached_goal = True
             break
@@ -580,7 +602,9 @@ def _run_hybrid_los_local_simulation(
         "sensor_params": sensor_params,
         "initial_robot_vel": fs["v"].copy(),
         "reached_goal": reached_goal,
+        "collided": collided,
         "numerical_issue": numerical_issue,
+        "collision_info": collision_info,
         "goal": fg["p"].copy(),
         "final_state": fish_state,
         "final_hist": hist,
@@ -638,6 +662,9 @@ def main() -> None:
     )
     print("local_planner:", result["local_planner_kind"])
     print("reached_goal:", result["reached_goal"])
+    print("collided:", result["collided"])
+    if result["collision_info"] is not None:
+        print("collision_info:", result["collision_info"])
     print("path_len:", len(result["path_hist"]))
     print("tracking_metrics:", result["tracking_metrics"])
 

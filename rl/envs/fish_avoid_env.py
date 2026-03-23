@@ -19,7 +19,7 @@ from rl.envs.geometry import (
     vector_angle,
 )
 from rl.envs.reward import compute_reward
-from simulation.local_planning.fin_controller import fin_controller
+from simulation.local_planning.fin_controller import fin_controller, velocity_to_attitude_refs
 
 
 class FishAvoidEnv(gym.Env):
@@ -145,8 +145,11 @@ class FishAvoidEnv(gym.Env):
         action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
         cmd_vel_body = action * self.action_velocity_limits
         cmd_vel_world = rotate_body_to_world(cmd_vel_body, self._rotation_body_to_world())
+        psi_ref, theta_ref, cmd_speed = velocity_to_attitude_refs(cmd_vel_world, self.state)
         a1_ref, a2_ref, a3_ref, a4_ref, alpha5_ref, self.ctrl_state = fin_controller(
-            cmd_vel_world,
+            psi_ref,
+            theta_ref,
+            cmd_speed,
             self.state,
             self.ctrl_state,
             self.dt,

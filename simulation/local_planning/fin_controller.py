@@ -5,16 +5,8 @@ import numpy as np
 from dynamics_wrapper.indices import Q0, Q1, Q2, Q3
 
 
-def fin_controller(
-    cmd_vel: np.ndarray,
-    current_state: np.ndarray,
-    controller_state: dict,
-    dt: float,
-    params: dict,
-) -> tuple[float, float, float, float, float, dict]:
+def extract_attitude(current_state: np.ndarray) -> tuple[float, float]:
     current_state = np.asarray(current_state, dtype=np.float64)
-    cmd_vel = np.asarray(cmd_vel, dtype=np.float64).reshape(3)
-
     q0 = current_state[Q0]
     q1 = current_state[Q1]
     q2 = current_state[Q2]
@@ -24,6 +16,12 @@ def fin_controller(
         2.0 * (q0 * q2 - q1 * q3),
         np.sqrt(max(0.0, 1.0 - (2.0 * (q0 * q2 - q1 * q3)) ** 2)),
     )
+    return float(psi), float(theta)
+
+
+def velocity_to_attitude_refs(cmd_vel: np.ndarray, current_state: np.ndarray) -> tuple[float, float, float]:
+    cmd_vel = np.asarray(cmd_vel, dtype=np.float64).reshape(3)
+    psi, theta = extract_attitude(current_state)
 
     vx_des, vy_des, vz_des = cmd_vel
     if np.linalg.norm(cmd_vel[:2]) > 0.05:
@@ -37,6 +35,25 @@ def fin_controller(
         theta_ref = np.arctan2(-vz_des, speed_xy_des)
     else:
         theta_ref = theta
+
+    return float(psi_ref), float(theta_ref), float(speed_des)
+
+
+def fin_controller(
+    psi_ref: float,
+    theta_ref: float,
+    cmd_speed: float,
+    current_state: np.ndarray,
+    controller_state: dict,
+    dt: float,
+    params: dict,
+) -> tuple[float, float, float, float, float, dict]:
+    current_state = np.asarray(current_state, dtype=np.float64)
+    psi_ref = float(psi_ref)
+    theta_ref = float(theta_ref)
+    cmd_speed = float(max(0.0, cmd_speed))
+
+    psi, theta = extract_attitude(current_state)
 
     e_theta = np.arctan2(np.sin(theta_ref - theta), np.cos(theta_ref - theta))
     e_theta_prev = controller_state.get("e_theta_prev", controller_state.get("e_z_prev", 0.0))
@@ -71,10 +88,9 @@ def fin_controller(
     a2_ref = params["A_rot_base"] - delta_ref
     a4_ref = params["A_rot_base"] + delta_ref
 
-    speed_cmd = float(np.linalg.norm(cmd_vel))
     v_max_expected = 0.4
-    scaling_factor = min(speed_cmd / (0.5 * v_max_expected), 2.5)
-    if speed_cmd < 0.05:
+    scaling_factor = min(cmd_speed / (0.5 * v_max_expected), 2.5)
+    if cmd_speed < 0.05:
         a1_ref = 0.0
         a3_ref = 0.0
     else:
@@ -89,6 +105,7 @@ def fin_controller(
     controller_state["e_psi"] = e_psi
     controller_state["alpha5_ref"] = alpha5_ref
     controller_state["delta_ref"] = delta_ref
+    controller_state["cmd_speed"] = cmd_speed
 
     fin_output_history = controller_state.setdefault("fin_output_history", [])
     fin_output = {

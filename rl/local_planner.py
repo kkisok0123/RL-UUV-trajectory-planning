@@ -13,7 +13,7 @@ from rl.envs.geometry import (
     rotate_body_to_world,
     rotate_world_to_body,
 )
-from simulation.local_planning.fin_controller import fin_controller
+from simulation.local_planning.fin_controller import fin_controller, velocity_to_attitude_refs
 
 
 class RLLocalPlanner:
@@ -119,8 +119,11 @@ class RLLocalPlanner:
         action = np.clip(np.asarray(action, dtype=np.float64).reshape(3), -1.0, 1.0)
         cmd_vel_body = action * self.action_velocity_limits
         cmd_vel_global = rotate_body_to_world(cmd_vel_body, self._rotation_body_to_world(fish_state))
+        psi_ref, theta_ref, cmd_speed = velocity_to_attitude_refs(cmd_vel_global, fish_state)
         a1_ref, a2_ref, a3_ref, a4_ref, alpha5_ref, controller_state = fin_controller(
-            cmd_vel_global,
+            psi_ref,
+            theta_ref,
+            cmd_speed,
             fish_state,
             controller_state,
             dt,

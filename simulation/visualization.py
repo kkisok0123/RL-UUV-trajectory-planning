@@ -2,9 +2,20 @@ from __future__ import annotations
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.animation import FuncAnimation
+from matplotlib.animation import FFMpegWriter, FuncAnimation, PillowWriter
 
 _LIVE_ANIMATIONS: list[FuncAnimation] = []
+
+
+def _save_animation(anim: FuncAnimation, save_path: str, fps: int = 20) -> None:
+    suffix = str(save_path).lower()
+    if suffix.endswith(".gif"):
+        writer = PillowWriter(fps=int(fps))
+    elif suffix.endswith(".mp4"):
+        writer = FFMpegWriter(fps=int(fps))
+    else:
+        raise ValueError("Animation save path must end with .gif or .mp4")
+    anim.save(save_path, writer=writer)
 
 
 def _sphere_mesh(center: np.ndarray, radius: float, u: np.ndarray, v: np.ndarray):
@@ -107,14 +118,11 @@ def _set_3d_axis_scale(
     axis_mins = np.asarray(axis_mins, dtype=np.float64).reshape(3)
     axis_maxs = np.asarray(axis_maxs, dtype=np.float64).reshape(3)
     axis_spans = np.maximum(axis_maxs - axis_mins, 1.0)
-    axis_centers = 0.5 * (axis_mins + axis_maxs)
-    max_half_span = 0.5 * float(np.max(axis_spans))
-
-    ax.set_xlim(float(axis_centers[0] - max_half_span), float(axis_centers[0] + max_half_span))
-    ax.set_ylim(float(axis_centers[1] - max_half_span), float(axis_centers[1] + max_half_span))
-    ax.set_zlim(float(axis_centers[2] - max_half_span), float(axis_centers[2] + max_half_span))
+    ax.set_xlim(float(axis_mins[0]), float(axis_maxs[0]))
+    ax.set_ylim(float(axis_mins[1]), float(axis_maxs[1]))
+    ax.set_zlim(float(axis_mins[2]), float(axis_maxs[2]))
     try:
-        ax.set_box_aspect((1.0, 1.0, 1.0))
+        ax.set_box_aspect(tuple(float(span) for span in axis_spans))
     except AttributeError:
         pass
 
@@ -135,7 +143,14 @@ def _unwrap_angle_series(angle_series: np.ndarray) -> np.ndarray:
     return angle_series
 
 
-def plot_hybrid_result(result: dict, static_obs: list[dict], dyn_obs: list[dict], goal: np.ndarray) -> None:
+def plot_hybrid_result(
+    result: dict,
+    static_obs: list[dict],
+    dyn_obs: list[dict],
+    goal: np.ndarray,
+    save_path: str | None = None,
+    fps: int = 20,
+) -> None:
     del dyn_obs
 
     traj_global = np.asarray(result["traj_global"]["xyz"], dtype=np.float64)
@@ -197,7 +212,7 @@ def plot_hybrid_result(result: dict, static_obs: list[dict], dyn_obs: list[dict]
             radius = float(dyn_obs_radii[obs_idx]) if obs_idx < dyn_obs_radii.size else 0.0
             bounds_points.append(dyn_obs_hist[:, obs_idx, :] - radius)
             bounds_points.append(dyn_obs_hist[:, obs_idx, :] + radius)
-    axis_mins, axis_maxs = _axis_limits_from_points(bounds_points)
+    axis_mins, axis_maxs = _axis_limits_from_points(bounds_points, min_span=2.0, pad_ratio=0.08)
     fig = plt.figure(
         figsize=(12, 10),
         facecolor="white",
@@ -208,6 +223,11 @@ def plot_hybrid_result(result: dict, static_obs: list[dict], dyn_obs: list[dict]
     ax.set_ylabel("Y (m)")
     ax.set_zlabel("Z (m)")
     _set_3d_axis_scale(ax, axis_mins, axis_maxs)
+    ax.set_autoscale_on(False)
+    try:
+        ax.set_proj_type("ortho")
+    except AttributeError:
+        pass
     ax.view_init(elev=30.0, azim=-37.5)
     ax.grid(True)
 
@@ -423,6 +443,7 @@ def plot_hybrid_result(result: dict, static_obs: list[dict], dyn_obs: list[dict]
         )
 
         _update_dyn_obstacles(frame_idx)
+        _set_3d_axis_scale(ax, axis_mins, axis_maxs)
 
         if frame_idx < len(title_hist):
             ax.set_title(title_hist[frame_idx])
@@ -446,12 +467,14 @@ def plot_hybrid_result(result: dict, static_obs: list[dict], dyn_obs: list[dict]
         fig,
         _update,
         frames=len(valid_path),
-        interval=80,
+        interval=15,
         blit=False,
         repeat=True,
     )
     fig._robot_anim = anim
     _LIVE_ANIMATIONS.append(anim)
+    if save_path:
+        _save_animation(anim, save_path, fps=fps)
     plt.tight_layout()
 
     if steps_executed > 0 and cmd_vel_des.shape[1] >= steps_executed and vel_act.shape[1] >= steps_executed:

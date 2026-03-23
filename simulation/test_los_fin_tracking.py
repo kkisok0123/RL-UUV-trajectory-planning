@@ -254,7 +254,7 @@ def run_passive_drift_test(
             dtype=np.float64,
         )
         a1_ref, a2_ref, a3_ref, a4_ref, alpha5_ref, ctrl_state = fin_controller(
-            cmd_vel_global, fish_state, ctrl_state, cfg.dt, fish_params
+            psi_ref, theta_ref, cmd_speed, fish_state, ctrl_state, cfg.dt, fish_params
         )
         action_ref = np.clip(
             np.array([a1_ref, a2_ref, a3_ref, a4_ref, alpha5_ref], dtype=np.float64),
@@ -416,7 +416,7 @@ def run_los_fin_tracking_test(
             dtype=np.float64,
         )
         a1_ref, a2_ref, a3_ref, a4_ref, alpha5_ref, ctrl_state = fin_controller(
-            cmd_vel_global, fish_state, ctrl_state, cfg.dt, fish_params
+            psi_ref, theta_ref, cmd_speed, fish_state, ctrl_state, cfg.dt, fish_params
         )
         action_ref = np.clip(np.array([a1_ref, a2_ref, a3_ref, a4_ref, alpha5_ref], dtype=np.float64), ref_min, ref_max)
         los_target = np.array(
@@ -622,7 +622,9 @@ def _plot_los_fin_tracking_result(result: dict, save_path: str | None, show: boo
             np.asarray(path_hist, dtype=np.float64),
             np.asarray(proj_hist, dtype=np.float64),
             np.asarray(los_target_hist, dtype=np.float64),
-        ]
+        ],
+        min_span=2.0,
+        pad_ratio=0.08,
     )
     _set_3d_axis_scale(ax3d, axis_mins, axis_maxs)
     ax3d.view_init(elev=28.0, azim=-55.0)
@@ -674,7 +676,7 @@ def _plot_los_fin_tracking_result(result: dict, save_path: str | None, show: boo
     fig.tight_layout()
 
     if animate:
-        interval_ms = max(20, int(1000.0 * result["config"].dt * 0.5))
+        interval_ms = max(15, int(1000.0 * result["config"].dt * 0.2))
 
         def _update(frame_idx: int):
             tracked_plot.set_data(path_hist[: frame_idx + 1, 0], path_hist[: frame_idx + 1, 1])

@@ -22,6 +22,21 @@ from rl.envs.reward import compute_reward
 from simulation.local_planning.fin_controller import fin_controller, velocity_to_attitude_refs
 
 
+def _quat_from_forward_vector(forward_world: np.ndarray) -> np.ndarray:
+    forward_world = np.asarray(forward_world, dtype=np.float64).reshape(3)
+    speed = float(np.linalg.norm(forward_world))
+    if speed < 1e-8:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    yaw = float(np.arctan2(forward_world[1], forward_world[0]))
+    pitch = float(np.arctan2(forward_world[2], np.linalg.norm(forward_world[:2])))
+    cy = np.cos(0.5 * yaw)
+    sy = np.sin(0.5 * yaw)
+    cp = np.cos(0.5 * pitch)
+    sp = np.sin(0.5 * pitch)
+    quat = np.array([cp * cy, sp * sy, -sp * cy, cp * sy], dtype=np.float64)
+    return quat / max(np.linalg.norm(quat), 1e-8)
+
+
 class FishAvoidEnv(gym.Env):
     metadata = {"render_modes": []}
 
@@ -66,6 +81,8 @@ class FishAvoidEnv(gym.Env):
         self.prev_action = np.zeros(3, dtype=np.float64)
         self.goal_xyz = np.zeros(3, dtype=np.float64)
         self.obstacles: list[dict] = []
+        self.scene_bounds_low = np.zeros(3, dtype=np.float64)
+        self.scene_bounds_high = np.zeros(3, dtype=np.float64)
         self.prev_goal_dist = 0.0
         self.t_k = 0.0
         self.step_count = 0
@@ -77,27 +94,76 @@ class FishAvoidEnv(gym.Env):
             "e_psi_int": 0.0,
         }
 
-    def _sample_goal(self) -> np.ndarray:
-        spawn = self.cfg["spawn"]
-        return self.np_random.uniform(spawn["goal_xyz_low"], spawn["goal_xyz_high"]).astype(np.float64)
+    def _corridor_basis(self, start_xyz: np.ndarray, goal_xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        corridor = np.asarray(goal_xyz, dtype=np.float64).reshape(3) - np.asarray(start_xyz, dtype=np.float64).reshape(3)
+        corridor_len = float(np.linalg.norm(corridor))
+        corridor_dir = corridor / max(corridor_len, 1e-8)
+        seed_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        if abs(float(np.dot(corridor_dir, seed_axis))) > 0.95:
+            seed_axis = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        side = np.cross(corridor_dir, seed_axis)
+        side = side / max(np.linalg.norm(side), 1e-8)
+        lift = np.cross(corridor_dir, side)
+        return corridor_dir, side, lift, corridor_len
 
-    def _sample_dynamic_velocity(self) -> np.ndarray:
+    def _sample_goal(self, start_xyz: np.ndarray) -> np.ndarray:
+        spawn = self.cfg["spawn"]
+        if "goal_distance_low" not in spawn:
+            return self.np_random.uniform(spawn["goal_xyz_low"], spawn["goal_xyz_high"]).astype(np.float64)
+        distance = float(self.np_random.uniform(spawn["goal_distance_low"], spawn["goal_distance_high"]))
+        azimuth = float(self.np_random.uniform(-spawn["goal_azimuth_range"], spawn["goal_azimuth_range"]))
+        elevation = float(self.np_random.uniform(-spawn["goal_elevation_range"], spawn["goal_elevation_range"]))
+        direction = np.array(
+            [
+                np.cos(elevation) * np.cos(azimuth),
+                np.cos(elevation) * np.sin(azimuth),
+                np.sin(elevation),
+            ],
+            dtype=np.float64,
+        )
+        return np.asarray(start_xyz, dtype=np.float64).reshape(3) + distance * direction
+
+    def _sample_dynamic_velocity(
+        self,
+        corridor_dir: np.ndarray,
+        side: np.ndarray,
+        lift: np.ndarray,
+    ) -> np.ndarray:
         speed = float(
             self.np_random.uniform(
                 self.cfg["spawn"]["dynamic_speed_low"],
                 self.cfg["spawn"]["dynamic_speed_high"],
             )
         )
-        direction = self.np_random.normal(size=3)
+        lateral_sign = -1.0 if bool(self.np_random.integers(0, 2)) else 1.0
+        direction = (
+            self.np_random.uniform(-0.30, 0.20) * np.asarray(corridor_dir, dtype=np.float64).reshape(3)
+            + lateral_sign * self.np_random.uniform(0.85, 1.20) * np.asarray(side, dtype=np.float64).reshape(3)
+            + self.np_random.uniform(-0.25, 0.25) * np.asarray(lift, dtype=np.float64).reshape(3)
+        )
         direction_norm = float(np.linalg.norm(direction))
         if direction_norm < 1e-8:
-            direction = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            direction = np.asarray(side, dtype=np.float64).reshape(3)
         else:
             direction = direction / direction_norm
         return speed * direction
 
+    def _sample_initial_forward(self, start_xyz: np.ndarray, goal_xyz: np.ndarray) -> np.ndarray:
+        spawn = self.cfg["spawn"]
+        corridor_dir, side, lift, _ = self._corridor_basis(start_xyz, goal_xyz)
+        lateral = np.tan(float(self.np_random.uniform(-spawn["initial_heading_range"], spawn["initial_heading_range"])))
+        vertical = np.tan(float(self.np_random.uniform(-spawn["initial_pitch_range"], spawn["initial_pitch_range"])))
+        forward = corridor_dir + lateral * side + vertical * lift
+        return forward / max(np.linalg.norm(forward), 1e-8)
+
+    def _reset_scene_bounds(self, start_xyz: np.ndarray, goal_xyz: np.ndarray) -> None:
+        margin = float(self.cfg["spawn"].get("scene_margin", 3.0))
+        self.scene_bounds_low = np.minimum(start_xyz, goal_xyz) - margin
+        self.scene_bounds_high = np.maximum(start_xyz, goal_xyz) + margin
+
     def _sample_obstacles(self, start_xyz: np.ndarray, goal_xyz: np.ndarray) -> list[dict]:
         spawn = self.cfg["spawn"]
+        corridor_dir, side, lift, corridor_len = self._corridor_basis(start_xyz, goal_xyz)
         num_obstacles = int(
             self.np_random.integers(spawn["num_obstacles_low"], spawn["num_obstacles_high"] + 1)
         )
@@ -108,9 +174,15 @@ class FishAvoidEnv(gym.Env):
             radius = float(
                 self.np_random.uniform(spawn["obstacle_radius_low"], spawn["obstacle_radius_high"])
             )
-            center = self.np_random.uniform(
-                spawn["obstacle_xyz_low"], spawn["obstacle_xyz_high"]
-            ).astype(np.float64)
+            along = float(self.np_random.uniform(spawn.get("corridor_along_low", 0.2), spawn.get("corridor_along_high", 0.9))) * corridor_len
+            lateral = float(self.np_random.uniform(-spawn.get("corridor_lateral_span", 2.5), spawn.get("corridor_lateral_span", 2.5)))
+            vertical = float(self.np_random.uniform(-spawn.get("corridor_vertical_span", 1.8), spawn.get("corridor_vertical_span", 1.8)))
+            center = (
+                np.asarray(start_xyz, dtype=np.float64).reshape(3)
+                + corridor_dir * along
+                + side * lateral
+                + lift * vertical
+            )
             if np.linalg.norm(center - start_xyz) <= spawn["start_clearance"] + radius:
                 continue
             if np.linalg.norm(center - goal_xyz) <= spawn["goal_clearance"] + radius:
@@ -122,14 +194,18 @@ class FishAvoidEnv(gym.Env):
                     valid = False
                     break
             if valid:
-                obstacles.append({"c": center, "r": radius, "v": np.zeros(3, dtype=np.float64)})
+                obstacles.append({"c": center.astype(np.float64), "r": radius, "v": np.zeros(3, dtype=np.float64)})
 
         if obstacles:
-            min_dynamic = min(int(spawn["dynamic_count_min"]), len(obstacles))
-            dynamic_count = int(self.np_random.integers(min_dynamic, len(obstacles) + 1))
-            dynamic_indices = self.np_random.choice(len(obstacles), size=dynamic_count, replace=False)
-            for idx in np.asarray(dynamic_indices, dtype=np.int64):
-                obstacles[int(idx)]["v"] = self._sample_dynamic_velocity()
+            dynamic_low = int(spawn.get("dynamic_count_low", spawn.get("dynamic_count_min", 0)))
+            dynamic_high = int(spawn.get("dynamic_count_high", len(obstacles)))
+            dynamic_low = max(0, min(dynamic_low, len(obstacles)))
+            dynamic_high = max(dynamic_low, min(dynamic_high, len(obstacles)))
+            dynamic_count = int(self.np_random.integers(dynamic_low, dynamic_high + 1))
+            if dynamic_count > 0:
+                dynamic_indices = self.np_random.choice(len(obstacles), size=dynamic_count, replace=False)
+                for idx in np.asarray(dynamic_indices, dtype=np.int64):
+                    obstacles[int(idx)]["v"] = self._sample_dynamic_velocity(corridor_dir, side, lift)
         return obstacles
 
     def _rotation_body_to_world(self, state: np.ndarray | None = None) -> np.ndarray:
@@ -159,13 +235,10 @@ class FishAvoidEnv(gym.Env):
         return np.clip(action_ref, self.ref_min, self.ref_max), cmd_vel_body, cmd_vel_world
 
     def _update_obstacles(self) -> None:
-        spawn = self.cfg["spawn"]
-        bounds_low = np.asarray(spawn["obstacle_bounds_low"], dtype=np.float64)
-        bounds_high = np.asarray(spawn["obstacle_bounds_high"], dtype=np.float64)
         for obstacle in self.obstacles:
             obstacle["c"] = obstacle["c"] + obstacle["v"] * self.dt
-            legal_low = bounds_low + obstacle["r"]
-            legal_high = bounds_high - obstacle["r"]
+            legal_low = self.scene_bounds_low + obstacle["r"]
+            legal_high = self.scene_bounds_high - obstacle["r"]
             for axis in range(3):
                 if obstacle["c"][axis] < legal_low[axis]:
                     obstacle["c"][axis] = legal_low[axis]
@@ -244,8 +317,18 @@ class FishAvoidEnv(gym.Env):
         self.state = self.initial_state_template.copy()
         self.state[[PX, PY, PZ]] = start_xyz
 
-        self.goal_xyz = self._sample_goal()
+        self.goal_xyz = self._sample_goal(start_xyz)
+        initial_forward = self._sample_initial_forward(start_xyz, self.goal_xyz)
+        initial_speed = float(self.np_random.uniform(spawn.get("initial_speed_low", 0.01), spawn.get("initial_speed_high", 0.05)))
+        self.state[Q0 : Q3 + 1] = _quat_from_forward_vector(initial_forward)
+        self.state[VX] = initial_speed
+        self.state[VY] = 0.0
+        self.state[VZ] = 0.0
+        self.state[WX] = 0.0
+        self.state[WY] = 0.0
+        self.state[WZ] = 0.0
         self.obstacles = self._sample_obstacles(start_xyz, self.goal_xyz)
+        self._reset_scene_bounds(start_xyz, self.goal_xyz)
         obs, info = self._build_obs()
         self.prev_goal_dist = float(info["goal_dist"])
         return obs, info

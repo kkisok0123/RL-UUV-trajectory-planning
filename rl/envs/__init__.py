@@ -1,4 +1,4 @@
-__all__ = ["FishAvoidEnv"]
+__all__ = ["FishAvoidEnv", "MPCSchedulerEnv"]
 
 
 def __getattr__(name: str):
@@ -6,4 +6,8 @@ def __getattr__(name: str):
         from .fish_avoid_env import FishAvoidEnv
 
         return FishAvoidEnv
+    if name == "MPCSchedulerEnv":
+        from .mpc_scheduler_env import MPCSchedulerEnv
+
+        return MPCSchedulerEnv
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

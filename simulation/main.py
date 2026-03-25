@@ -19,7 +19,6 @@ from rl.envs.geometry import nearest_obstacle_info
 from rl.local_planner import RLLocalPlanner
 from simulation.global_planning.los import los_guidance_3d
 from simulation.local_planning.fin_controller import fin_controller
-from simulation.local_planning.mpc_planner import MPCLocalPlanner
 from simulation.local_planning.path_utils import find_local_target
 from simulation.local_planning.sensor import get_visible_obstacles
 
@@ -266,12 +265,7 @@ def _append_controller_snapshot(sa_settings: dict, index: int, snapshot: dict | 
     sa_settings["delta_ref"][index] = float(snapshot.get("delta_ref", np.nan))
 
 
-def _planner_label(local_planner_kind: str) -> str:
-    return "RL" if local_planner_kind == "rl" else "MPC"
-
-
-def _run_hybrid_los_local_simulation(
-    local_planner_kind: str,
+def _run_hybrid_los_rl_simulation(
     model_path=None,
     visualize: bool = False,
     animation_path: str | None = None,
@@ -279,9 +273,6 @@ def _run_hybrid_los_local_simulation(
     controller_params_override: dict | None = None,
     sim_config: HybridSimulationConfig | None = None,
 ) -> dict:
-    if local_planner_kind not in {"rl", "mpc"}:
-        raise ValueError(f"Unsupported local planner kind: {local_planner_kind}")
-
     cfg = HybridSimulationConfig() if sim_config is None else sim_config
     env_cfg = build_fish_env_config()
     sa_settings: dict[str, np.ndarray | list] = {}
@@ -357,10 +348,7 @@ def _run_hybrid_los_local_simulation(
         for key, value in controller_params_override.items():
             fish_params[key] = float(value)
 
-    if local_planner_kind == "rl":
-        local_planner = RLLocalPlanner(model_path=model_path, config=env_cfg)
-    else:
-        local_planner = MPCLocalPlanner(config=env_cfg)
+    local_planner = RLLocalPlanner(model_path=model_path, config=env_cfg)
 
     curr_pos = fs["p"].copy()
     robot_vel = fs["v"].copy()
@@ -393,8 +381,6 @@ def _run_hybrid_los_local_simulation(
     sa_settings["psi_int"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
     sa_settings["alpha5_ref"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
     sa_settings["delta_ref"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
-    sa_settings["mpc_cmd_speed"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
-    sa_settings["mpc_risk_max"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
     sa_settings["mode"] = []
     sa_settings["local_planner_success"] = []
 
@@ -440,51 +426,23 @@ def _run_hybrid_los_local_simulation(
         local_target_log = np.full(3, np.nan, dtype=np.float64)
         controller_snapshot: dict | None = None
         local_success = True
-        mpc_cmd_speed = np.nan
-        mpc_risk_max = np.nan
 
         if mode == "LOCAL_AVOIDANCE":
             local_target = find_local_target(traj_global, curr_pos, cfg.local_lookahead)
             local_target_log = np.asarray(local_target, dtype=np.float64).copy()
-            if local_planner_kind == "rl":
-                action_ref, _, _, cmd_vel_global, ctrl_state = local_planner.plan(
-                    fish_state,
-                    hist,
-                    local_target,
-                    visible_obs,
-                    ctrl_state,
-                    cfg.dt,
-                    fish_params,
-                )
-                controller_snapshot = ctrl_state
-            else:
-                attitude_ref, cmd_speed_ref, planner_info = local_planner.plan(
-                    fish_state,
-                    hist,
-                    local_target,
-                    visible_obs,
-                    cmd_speed,
-                )
-                psi_ref = float(attitude_ref[0])
-                theta_ref = float(attitude_ref[1])
-                cmd_vel_global = np.asarray(planner_info.get("cmd_vel_global", np.zeros(3)), dtype=np.float64).reshape(3)
-                mpc_cmd_speed = float(planner_info.get("cmd_speed_ref", cmd_speed_ref))
-                mpc_risk_max = float(planner_info.get("risk_max", np.nan))
-                local_success = bool(planner_info.get("success", False))
-                a1_ref, a2_ref, a3_ref, a4_ref, alpha5_ref, ctrl_state = fin_controller(
-                    psi_ref,
-                    theta_ref,
-                    cmd_speed_ref,
-                    fish_state,
-                    ctrl_state,
-                    cfg.dt,
-                    fish_params,
-                )
-                action_ref = np.array([a1_ref, a2_ref, a3_ref, a4_ref, alpha5_ref], dtype=np.float64)
-                controller_snapshot = ctrl_state
+            action_ref, _, _, cmd_vel_global, ctrl_state = local_planner.plan(
+                fish_state,
+                hist,
+                local_target,
+                visible_obs,
+                ctrl_state,
+                cfg.dt,
+                fish_params,
+            )
+            controller_snapshot = ctrl_state
             sa_settings["cmd_vel_des"][:, k - 1] = cmd_vel_global
             title_hist.append(
-                f"Step {k}: LOCAL AVOIDANCE ({_planner_label(local_planner_kind)})"
+                f"Step {k}: LOCAL AVOIDANCE (RL)"
                 f"{'' if not np.isfinite(d_min) else f' - Visible Dist: {d_min:.2f}'}"
             )
         else:
@@ -537,8 +495,6 @@ def _run_hybrid_los_local_simulation(
             )
 
         sa_settings["local_planner_success"].append(local_success)
-        sa_settings["mpc_cmd_speed"][k - 1] = mpc_cmd_speed
-        sa_settings["mpc_risk_max"][k - 1] = mpc_risk_max
         _append_controller_snapshot(sa_settings, k - 1, controller_snapshot)
 
         action_ref = np.clip(action_ref, ref_min, ref_max)
@@ -616,7 +572,7 @@ def _run_hybrid_los_local_simulation(
         "goal": fg["p"].copy(),
         "final_state": fish_state,
         "final_hist": hist,
-        "local_planner_kind": local_planner_kind,
+        "local_planner_kind": "rl",
     }
     result["tracking_metrics"] = _compute_tracking_metrics(sa_settings, fish_params, steps_executed)
     if visualize:
@@ -634,8 +590,7 @@ def run_hybrid_los_rl_simulation(
     controller_params_override: dict | None = None,
     sim_config: HybridSimulationConfig | None = None,
 ) -> dict:
-    return _run_hybrid_los_local_simulation(
-        "rl",
+    return _run_hybrid_los_rl_simulation(
         model_path=model_path,
         visualize=visualize,
         animation_path=animation_path,
@@ -645,27 +600,10 @@ def run_hybrid_los_rl_simulation(
     )
 
 
-def run_hybrid_los_mpc_simulation(
-    visualize: bool = False,
-    animation_path: str | None = None,
-    animation_fps: int = 20,
-    controller_params_override: dict | None = None,
-    sim_config: HybridSimulationConfig | None = None,
-) -> dict:
-    return _run_hybrid_los_local_simulation(
-        "mpc",
-        visualize=visualize,
-        animation_path=animation_path,
-        animation_fps=animation_fps,
-        controller_params_override=controller_params_override,
-        sim_config=sim_config,
-    )
-
-
 def main() -> None:
-    result = run_hybrid_los_mpc_simulation(
+    result = run_hybrid_los_rl_simulation(
         visualize=True,
-        animation_path="data_saving/hybrid_los_mpc.gif",
+        animation_path="data_saving/hybrid_los_rl.gif",
         animation_fps=30,
     )
     print("local_planner:", result["local_planner_kind"])

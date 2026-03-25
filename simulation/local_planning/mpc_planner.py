@@ -73,15 +73,17 @@ class MPCLocalPlanner:
         self.speed_risk_slowdown = float(adaptive_cfg.get("speed_risk_slowdown", 0.65))
         self.track_stale_steps = int(mpc_cfg.get("track_stale_steps", 5))
 
-        self._solver: ca.Function | None = None
+        self._solver: dict[str, object] | None = None
         self._obstacle_history: dict[object, dict[str, np.ndarray | int]] = {}
         self._prev_robot_velocity_world: np.ndarray | None = None
         self._plan_step = 0
+        self._warm_start: dict[str, np.ndarray] = {}
 
     def reset(self) -> None:
         self._obstacle_history.clear()
         self._prev_robot_velocity_world = None
         self._plan_step = 0
+        self._warm_start.clear()
 
     def _rotation_body_to_world(self, fish_state: np.ndarray) -> np.ndarray:
         fish_state = np.asarray(fish_state, dtype=np.float64)
@@ -94,7 +96,7 @@ class MPCLocalPlanner:
         rotation = self._rotation_body_to_world(fish_state)
         return rotate_body_to_world(fish_state[[VX, VY, VZ]], rotation)
 
-    def _build_solver(self) -> ca.Function:
+    def _build_solver(self) -> dict[str, object]:
         opti = ca.Opti()
 
         p0 = opti.parameter(POS_DIM, 1)
@@ -109,6 +111,12 @@ class MPCLocalPlanner:
         obs_a = opti.parameter(POS_DIM, self.max_obstacles)
         obs_r = opti.parameter(1, self.max_obstacles)
         num_obs = opti.parameter(1, 1)
+        w_goal_param = opti.parameter(1, 1)
+        w_terminal_param = opti.parameter(1, 1)
+        w_obs_param = opti.parameter(1, 1)
+        w_collision_param = opti.parameter(1, 1)
+        obstacle_margin_param = opti.parameter(1, 1)
+        collision_margin_param = opti.parameter(1, 1)
 
         u = opti.variable(CONTROL_DIM, self.horizon)
         p = opti.variable(POS_DIM, self.horizon + 1)
@@ -149,7 +157,7 @@ class MPCLocalPlanner:
             opti.subject_to(speed[:, k + 1] == speed_next)
             opti.subject_to(p[:, k + 1] == p_next)
 
-            cost += self.w_goal * ca.dot(p_next - p_goal, p_next - p_goal)
+            cost += w_goal_param[0, 0] * ca.dot(p_next - p_goal, p_next - p_goal)
             risk_max_step = ca.MX(0.0)
 
             for obs_idx in range(self.max_obstacles):
@@ -170,7 +178,7 @@ class MPCLocalPlanner:
                 closing_speed = ca.fmax(0.0, -ca.dot(rel_v, n_hat))
                 closing_acc = ca.fmax(0.0, -ca.dot(rel_a, n_hat))
                 clearance_term = _clip_mx(
-                    (self.obstacle_margin - clearance) / max(self.obstacle_margin, 1e-6),
+                    (obstacle_margin_param[0, 0] - clearance) / ca.fmax(obstacle_margin_param[0, 0], 1e-6),
                     0.0,
                     1.0,
                 )
@@ -187,20 +195,20 @@ class MPCLocalPlanner:
                 )
 
                 adaptive_obstacle_margin = ca.fmin(
-                    self.obstacle_margin * (1.0 + self.obstacle_margin_gain * risk),
-                    self.obstacle_margin * self.obstacle_margin_scale_max,
+                    obstacle_margin_param[0, 0] * (1.0 + self.obstacle_margin_gain * risk),
+                    obstacle_margin_param[0, 0] * self.obstacle_margin_scale_max,
                 )
                 adaptive_collision_margin = ca.fmin(
-                    self.collision_margin * (1.0 + self.collision_margin_gain * risk),
-                    self.collision_margin * self.collision_margin_scale_max,
+                    collision_margin_param[0, 0] * (1.0 + self.collision_margin_gain * risk),
+                    collision_margin_param[0, 0] * self.collision_margin_scale_max,
                 )
                 adaptive_w_obs = ca.fmin(
-                    self.w_obs * (1.0 + self.w_obs_gain * risk),
-                    self.w_obs * self.w_obs_scale_max,
+                    w_obs_param[0, 0] * (1.0 + self.w_obs_gain * risk),
+                    w_obs_param[0, 0] * self.w_obs_scale_max,
                 )
                 adaptive_w_collision = ca.fmin(
-                    self.w_collision * (1.0 + self.w_collision_gain * risk),
-                    self.w_collision * self.w_collision_scale_max,
+                    w_collision_param[0, 0] * (1.0 + self.w_collision_gain * risk),
+                    w_collision_param[0, 0] * self.w_collision_scale_max,
                 )
 
                 near_pen = _smooth_positive_part(adaptive_obstacle_margin - clearance)
@@ -229,7 +237,7 @@ class MPCLocalPlanner:
             opti.subject_to(speed_next >= self.speed_min)
             opti.subject_to(speed_next <= speed_cap_step)
 
-        cost += self.w_terminal * ca.dot(p[:, self.horizon] - p_goal, p[:, self.horizon] - p_goal)
+        cost += w_terminal_param[0, 0] * ca.dot(p[:, self.horizon] - p_goal, p[:, self.horizon] - p_goal)
         opti.minimize(cost)
 
         opti.set_initial(p, np.zeros((POS_DIM, self.horizon + 1), dtype=np.float64))
@@ -240,31 +248,106 @@ class MPCLocalPlanner:
         opti.solver(
             "ipopt",
             {"print_time": False},
-            {"print_level": 0, "sb": "yes", "max_iter": 100, "tol": 1e-3, "linear_solver": "mumps"},
+            {
+                "print_level": 0,
+                "sb": "yes",
+                "max_iter": 100,
+                "tol": 1e-3,
+                "linear_solver": "mumps",
+                "warm_start_init_point": "yes",
+                "warm_start_bound_push": 1e-6,
+                "warm_start_mult_bound_push": 1e-6,
+                "warm_start_slack_bound_push": 1e-6,
+            },
         )
-        return opti.to_function(
-            "adaptive_attitude_speed_mpc_solver",
-            [
-                p0,
-                psi0,
-                theta0,
-                v_prev_world,
-                speed0,
-                p_goal,
-                cmd_speed_nominal,
-                obs_c,
-                obs_v,
-                obs_a,
-                obs_r,
-                num_obs,
-            ],
-            [u, p, psi, theta, speed, cost],
-        )
+        return {
+            "opti": opti,
+            "params": {
+                "p0": p0,
+                "psi0": psi0,
+                "theta0": theta0,
+                "v_prev_world": v_prev_world,
+                "speed0": speed0,
+                "p_goal": p_goal,
+                "cmd_speed_nominal": cmd_speed_nominal,
+                "obs_c": obs_c,
+                "obs_v": obs_v,
+                "obs_a": obs_a,
+                "obs_r": obs_r,
+                "num_obs": num_obs,
+                "w_goal_param": w_goal_param,
+                "w_terminal_param": w_terminal_param,
+                "w_obs_param": w_obs_param,
+                "w_collision_param": w_collision_param,
+                "obstacle_margin_param": obstacle_margin_param,
+                "collision_margin_param": collision_margin_param,
+            },
+            "vars": {
+                "u": u,
+                "p": p,
+                "psi": psi,
+                "theta": theta,
+                "speed": speed,
+                "cost": cost,
+            },
+        }
 
-    def _ensure_solver(self) -> ca.Function:
+    def _ensure_solver(self) -> dict[str, object]:
         if self._solver is None:
             self._solver = self._build_solver()
         return self._solver
+
+    @staticmethod
+    def _shift_columns(values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float64)
+        if values.ndim != 2 or values.shape[1] <= 1:
+            return values.copy()
+        return np.concatenate([values[:, 1:], values[:, -1:]], axis=1)
+
+    def _set_default_initial_guess(
+        self,
+        problem: dict[str, object],
+        p0: np.ndarray,
+        psi0: float,
+        theta0: float,
+        speed0: float,
+        p_goal: np.ndarray,
+        cmd_speed_nominal: float,
+    ) -> None:
+        opti = problem["opti"]
+        vars_dict = problem["vars"]
+
+        del p0, psi0, theta0, speed0, p_goal, cmd_speed_nominal
+        opti.set_initial(vars_dict["p"], np.zeros((POS_DIM, self.horizon + 1), dtype=np.float64))
+        opti.set_initial(vars_dict["psi"], np.zeros((1, self.horizon + 1), dtype=np.float64))
+        opti.set_initial(vars_dict["theta"], np.zeros((1, self.horizon + 1), dtype=np.float64))
+        opti.set_initial(vars_dict["speed"], np.full((1, self.horizon + 1), self.speed_min, dtype=np.float64))
+        opti.set_initial(vars_dict["u"], np.zeros((CONTROL_DIM, self.horizon), dtype=np.float64))
+
+    def _apply_warm_start(self, problem: dict[str, object]) -> None:
+        if not self._warm_start:
+            return
+        vars_dict = problem["vars"]
+        for name in ("u", "p", "psi", "theta", "speed"):
+            values = self._warm_start.get(name)
+            if values is not None:
+                problem["opti"].set_initial(vars_dict[name], values)
+
+    def _store_warm_start(
+        self,
+        u_seq: np.ndarray,
+        p_seq: np.ndarray,
+        psi_seq: np.ndarray,
+        theta_seq: np.ndarray,
+        speed_seq: np.ndarray,
+    ) -> None:
+        self._warm_start = {
+            "u": self._shift_columns(np.asarray(u_seq, dtype=np.float64)),
+            "p": self._shift_columns(np.asarray(p_seq, dtype=np.float64)),
+            "psi": self._shift_columns(np.asarray(psi_seq, dtype=np.float64).reshape(1, -1)),
+            "theta": self._shift_columns(np.asarray(theta_seq, dtype=np.float64).reshape(1, -1)),
+            "speed": self._shift_columns(np.asarray(speed_seq, dtype=np.float64).reshape(1, -1)),
+        }
 
     def _pack_obstacles(
         self,
@@ -309,9 +392,10 @@ class MPCLocalPlanner:
         closing_speed: float,
         closing_acc: float,
         obstacle_radius: float,
+        obstacle_margin: float,
     ) -> float:
         clearance_term = np.clip(
-            (self.obstacle_margin - clearance) / max(self.obstacle_margin, 1e-6),
+            (float(obstacle_margin) - clearance) / max(float(obstacle_margin), 1e-6),
             0.0,
             1.0,
         )
@@ -342,6 +426,8 @@ class MPCLocalPlanner:
         obs_a: np.ndarray,
         obs_r: np.ndarray,
         num_obs: int,
+        obstacle_margin: float,
+        collision_margin: float,
     ) -> dict:
         current_velocity_world = np.asarray(current_velocity_world, dtype=np.float64).reshape(3)
         previous_velocity_world = np.asarray(previous_velocity_world, dtype=np.float64).reshape(3)
@@ -368,8 +454,8 @@ class MPCLocalPlanner:
 
         risk_per_obstacle = np.zeros(num_obs, dtype=np.float64)
         risk_max = 0.0
-        adaptive_margin_max = self.obstacle_margin
-        adaptive_collision_margin_max = self.collision_margin
+        adaptive_margin_max = float(obstacle_margin)
+        adaptive_collision_margin_max = float(collision_margin)
 
         for step_idx in range(1, p_seq.shape[1]):
             prev_velocity = previous_velocity_world if step_idx == 1 else vel_seq[:, step_idx - 1]
@@ -389,21 +475,27 @@ class MPCLocalPlanner:
                 rel_a = obs_a[:, obs_idx] - robot_acc
                 closing_speed = max(0.0, -float(np.dot(rel_v, n_hat)))
                 closing_acc = max(0.0, -float(np.dot(rel_a, n_hat)))
-                risk = self._risk_value(clearance, closing_speed, closing_acc, float(obs_r[0, obs_idx]))
+                risk = self._risk_value(
+                    clearance,
+                    closing_speed,
+                    closing_acc,
+                    float(obs_r[0, obs_idx]),
+                    obstacle_margin,
+                )
                 risk_per_obstacle[obs_idx] = max(risk_per_obstacle[obs_idx], risk)
                 risk_max = max(risk_max, risk)
                 adaptive_margin_max = max(
                     adaptive_margin_max,
                     min(
-                        self.obstacle_margin * (1.0 + self.obstacle_margin_gain * risk),
-                        self.obstacle_margin * self.obstacle_margin_scale_max,
+                        obstacle_margin * (1.0 + self.obstacle_margin_gain * risk),
+                        obstacle_margin * self.obstacle_margin_scale_max,
                     ),
                 )
                 adaptive_collision_margin_max = max(
                     adaptive_collision_margin_max,
                     min(
-                        self.collision_margin * (1.0 + self.collision_margin_gain * risk),
-                        self.collision_margin * self.collision_margin_scale_max,
+                        collision_margin * (1.0 + self.collision_margin_gain * risk),
+                        collision_margin * self.collision_margin_scale_max,
                     ),
                 )
 
@@ -414,6 +506,26 @@ class MPCLocalPlanner:
             "adaptive_collision_margin_max": float(adaptive_collision_margin_max),
         }
 
+    def _resolve_strategy_params(self, strategy_params: dict | None) -> dict:
+        params = {
+            "mode_name": "mpc",
+            "speed_scale": 1.0,
+            "W_goal": self.w_goal,
+            "W_terminal": self.w_terminal,
+            "W_obs": self.w_obs,
+            "W_collision": self.w_collision,
+            "obstacle_margin": self.obstacle_margin,
+            "collision_margin": self.collision_margin,
+        }
+        if strategy_params:
+            for key, value in strategy_params.items():
+                if key in params:
+                    params[key] = float(value) if key != "mode_name" else value
+                elif key == "mode_name":
+                    params["mode_name"] = str(value)
+        params["mode_name"] = str(params["mode_name"])
+        return params
+
     def plan(
         self,
         fish_state: np.ndarray,
@@ -421,9 +533,14 @@ class MPCLocalPlanner:
         local_target: np.ndarray,
         visible_obstacles: list[dict],
         cmd_speed: float,
+        strategy_params: dict | None = None,
     ) -> tuple[np.ndarray, float, dict]:
         del hist
-        solver = self._ensure_solver()
+        problem = self._ensure_solver()
+        opti = problem["opti"]
+        params = problem["params"]
+        vars_dict = problem["vars"]
+        active_strategy = self._resolve_strategy_params(strategy_params)
 
         fish_state = np.asarray(fish_state, dtype=np.float64).reshape(-1)
         p0 = fish_state[[PX, PY, PZ]].reshape(3, 1)
@@ -438,27 +555,57 @@ class MPCLocalPlanner:
 
         p_goal = np.asarray(local_target, dtype=np.float64).reshape(3, 1)
         obs_c, obs_v, obs_a, obs_r, num_obs, track_keys = self._pack_obstacles(visible_obstacles)
+        cmd_speed_nominal = max(self.speed_min, float(cmd_speed) * float(active_strategy["speed_scale"]))
 
         try:
-            u_opt, p_opt, psi_opt, theta_opt, speed_opt, total_cost = solver(
-                p0,
-                np.array([[psi0]], dtype=np.float64),
-                np.array([[theta0]], dtype=np.float64),
-                previous_velocity_world.reshape(3, 1),
-                np.array([[speed0]], dtype=np.float64),
-                p_goal,
-                np.array([[float(cmd_speed)]], dtype=np.float64),
-                obs_c,
-                obs_v,
-                obs_a,
-                obs_r,
-                np.array([[num_obs]], dtype=np.float64),
+            opti.set_value(params["p0"], p0)
+            opti.set_value(params["psi0"], np.array([[psi0]], dtype=np.float64))
+            opti.set_value(params["theta0"], np.array([[theta0]], dtype=np.float64))
+            opti.set_value(params["v_prev_world"], previous_velocity_world.reshape(3, 1))
+            opti.set_value(params["speed0"], np.array([[speed0]], dtype=np.float64))
+            opti.set_value(params["p_goal"], p_goal)
+            opti.set_value(params["cmd_speed_nominal"], np.array([[cmd_speed_nominal]], dtype=np.float64))
+            opti.set_value(params["obs_c"], obs_c)
+            opti.set_value(params["obs_v"], obs_v)
+            opti.set_value(params["obs_a"], obs_a)
+            opti.set_value(params["obs_r"], obs_r)
+            opti.set_value(params["num_obs"], np.array([[num_obs]], dtype=np.float64))
+            opti.set_value(params["w_goal_param"], np.array([[float(active_strategy["W_goal"])]], dtype=np.float64))
+            opti.set_value(
+                params["w_terminal_param"],
+                np.array([[float(active_strategy["W_terminal"])]], dtype=np.float64),
             )
-            u_seq = np.asarray(u_opt, dtype=np.float64)
-            p_seq = np.asarray(p_opt, dtype=np.float64)
-            psi_seq = np.asarray(psi_opt, dtype=np.float64).reshape(-1)
-            theta_seq = np.asarray(theta_opt, dtype=np.float64).reshape(-1)
-            speed_seq = np.asarray(speed_opt, dtype=np.float64).reshape(-1)
+            opti.set_value(params["w_obs_param"], np.array([[float(active_strategy["W_obs"])]], dtype=np.float64))
+            opti.set_value(
+                params["w_collision_param"],
+                np.array([[float(active_strategy["W_collision"])]], dtype=np.float64),
+            )
+            opti.set_value(
+                params["obstacle_margin_param"],
+                np.array([[float(active_strategy["obstacle_margin"])]], dtype=np.float64),
+            )
+            opti.set_value(
+                params["collision_margin_param"],
+                np.array([[float(active_strategy["collision_margin"])]], dtype=np.float64),
+            )
+            self._set_default_initial_guess(problem, p0, psi0, theta0, speed0, p_goal, cmd_speed_nominal)
+            self._apply_warm_start(problem)
+
+            solution = opti.solve_limited()
+            stats = opti.stats()
+            u_seq = np.asarray(solution.value(vars_dict["u"]), dtype=np.float64)
+            p_seq = np.asarray(solution.value(vars_dict["p"]), dtype=np.float64)
+            psi_seq = np.asarray(solution.value(vars_dict["psi"]), dtype=np.float64).reshape(-1)
+            theta_seq = np.asarray(solution.value(vars_dict["theta"]), dtype=np.float64).reshape(-1)
+            speed_seq = np.asarray(solution.value(vars_dict["speed"]), dtype=np.float64).reshape(-1)
+            total_cost = float(np.asarray(solution.value(vars_dict["cost"]), dtype=np.float64).reshape(-1)[0])
+            self._store_warm_start(
+                u_seq,
+                p_seq,
+                psi_seq,
+                theta_seq,
+                speed_seq,
+            )
             attitude_ref = np.array([u_seq[0, 0], u_seq[1, 0]], dtype=np.float64)
             cmd_speed_ref = float(u_seq[2, 0])
             cmd_vel_global = np.array(
@@ -481,10 +628,15 @@ class MPCLocalPlanner:
                 obs_a,
                 obs_r,
                 int(num_obs),
+                float(active_strategy["obstacle_margin"]),
+                float(active_strategy["collision_margin"]),
             )
             planner_info = {
-                "success": True,
-                "cost": float(np.asarray(total_cost).reshape(-1)[0]),
+                "success": bool(
+                    stats.get("success", False)
+                    or stats.get("return_status") in {"Maximum_Iterations_Exceeded", "Solved_To_Acceptable_Level"}
+                ),
+                "cost": total_cost,
                 "local_target": p_goal.reshape(-1).copy(),
                 "psi_ref": float(attitude_ref[0]),
                 "theta_ref": float(attitude_ref[1]),
@@ -496,12 +648,16 @@ class MPCLocalPlanner:
                 "theta_seq": theta_seq,
                 "speed_seq": speed_seq,
                 "track_keys": track_keys,
+                "mode_name": active_strategy["mode_name"],
+                "strategy_params": active_strategy.copy(),
+                "solver_status": stats.get("return_status"),
             }
             planner_info.update(diagnostics)
             return attitude_ref, cmd_speed_ref, planner_info
         except Exception as exc:
+            self._warm_start.clear()
             fallback = np.array([psi0, theta0], dtype=np.float64)
-            fallback_speed = float(max(0.7 * float(cmd_speed), self.speed_min))
+            fallback_speed = float(max(0.7 * cmd_speed_nominal, self.speed_min))
             cmd_vel_global = np.array(
                 [
                     fallback_speed * np.cos(theta0) * np.cos(psi0),
@@ -521,9 +677,11 @@ class MPCLocalPlanner:
                 "speed_seq": np.array([fallback_speed], dtype=np.float64),
                 "risk_max": 0.0,
                 "risk_per_obstacle": np.zeros(int(num_obs), dtype=np.float64),
-                "adaptive_margin_max": float(self.obstacle_margin),
-                "adaptive_collision_margin_max": float(self.collision_margin),
+                "adaptive_margin_max": float(active_strategy["obstacle_margin"]),
+                "adaptive_collision_margin_max": float(active_strategy["collision_margin"]),
                 "track_keys": track_keys,
+                "mode_name": active_strategy["mode_name"],
+                "strategy_params": active_strategy.copy(),
             }
         finally:
             self._prev_robot_velocity_world = current_velocity_world.copy()

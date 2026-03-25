@@ -9,9 +9,9 @@ def build_ppo_config() -> dict:
         "clip_range": 0.2,
         "ent_coef": 0.01,
         "vf_coef": 0.5,
-        "total_timesteps": 20_000,
+        "total_timesteps": 500_000,
         "n_envs": 4,
-        "eval_freq": 5_000,
+        "eval_freq": 20_000,
         "n_eval_episodes": 5,
         "seed": 7,
     }

@@ -20,6 +20,7 @@ from rl.envs.geometry import (
 )
 from rl.envs.reward import compute_reward
 from simulation.local_planning.fin_controller import fin_controller, velocity_to_attitude_refs
+from simulation.local_planning.sensor import get_visible_obstacles
 
 
 def _quat_from_forward_vector(forward_world: np.ndarray) -> np.ndarray:
@@ -70,6 +71,9 @@ class FishAvoidEnv(gym.Env):
         self.ref_max = np.asarray(self.cfg["ref_max"], dtype=np.float64)
         self.action_velocity_limits = np.asarray(self.cfg["action_velocity_limits"], dtype=np.float64)
         self.controller_params = deepcopy(self.cfg["controller_params"])
+        self.sensor_cfg = deepcopy(self.cfg.get("sensor", {}))
+        self.observation_noise_cfg = deepcopy(self.cfg.get("observation_noise", {}))
+        self.disturbance_cfg = deepcopy(self.cfg.get("disturbance", {}))
 
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
         self.observation_space = spaces.Box(
@@ -87,6 +91,7 @@ class FishAvoidEnv(gym.Env):
         self.t_k = 0.0
         self.step_count = 0
         self.backend = dynamics_backend_name()
+        self.current_world = np.zeros(3, dtype=np.float64)
         self.ctrl_state = {
             "e_theta_prev": 0.0,
             "e_theta_int": 0.0,
@@ -155,6 +160,103 @@ class FishAvoidEnv(gym.Env):
         vertical = np.tan(float(self.np_random.uniform(-spawn["initial_pitch_range"], spawn["initial_pitch_range"])))
         forward = corridor_dir + lateral * side + vertical * lift
         return forward / max(np.linalg.norm(forward), 1e-8)
+
+    def _sample_current_world(self) -> np.ndarray:
+        current_low = float(self.disturbance_cfg.get("current_speed_low", 0.0))
+        current_high = float(self.disturbance_cfg.get("current_speed_high", 0.0))
+        if current_high <= 1e-9:
+            return np.zeros(3, dtype=np.float64)
+
+        speed = float(self.np_random.uniform(current_low, current_high))
+        azimuth = float(self.np_random.uniform(-np.pi, np.pi))
+        elevation = float(
+            self.np_random.uniform(
+                -float(self.disturbance_cfg.get("current_elevation_range", 0.0)),
+                float(self.disturbance_cfg.get("current_elevation_range", 0.0)),
+            )
+        )
+        return speed * np.array(
+            [
+                np.cos(elevation) * np.cos(azimuth),
+                np.cos(elevation) * np.sin(azimuth),
+                np.sin(elevation),
+            ],
+            dtype=np.float64,
+        )
+
+    def _update_current_world(self) -> None:
+        walk_std = float(self.disturbance_cfg.get("current_walk_std", 0.0))
+        decay = float(self.disturbance_cfg.get("current_decay", 1.0))
+        if walk_std > 0.0:
+            self.current_world = decay * self.current_world + self.np_random.normal(
+                0.0, walk_std, size=3
+            ).astype(np.float64)
+
+        current_speed_max = float(self.disturbance_cfg.get("current_speed_max", 0.0))
+        current_norm = float(np.linalg.norm(self.current_world))
+        if current_speed_max > 0.0 and current_norm > current_speed_max:
+            self.current_world *= current_speed_max / max(current_norm, 1e-8)
+
+    def _collect_visible_obstacles(
+        self,
+        position_world: np.ndarray,
+        velocity_world: np.ndarray,
+    ) -> tuple[list[dict], dict]:
+        safe_zone = get_visible_obstacles(position_world, velocity_world, self.obstacles, self.sensor_cfg)
+        blocked_idx = np.flatnonzero(safe_zone["is_blocked"])
+        if blocked_idx.size == 0:
+            return [], safe_zone
+
+        hit_points = (
+            safe_zone["origin"].reshape(1, 3)
+            + safe_zone["rays"][:, blocked_idx].T * safe_zone["dists"][blocked_idx].reshape(-1, 1)
+        )
+        hit_tolerance = float(self.sensor_cfg.get("hit_tolerance", 0.1))
+        miss_rate = float(self.sensor_cfg.get("miss_rate", 0.0))
+        visible_obstacles: list[dict] = []
+
+        for obstacle in self.obstacles:
+            center = np.asarray(obstacle["c"], dtype=np.float64).reshape(3)
+            boundary_error = np.abs(np.linalg.norm(hit_points - center.reshape(1, 3), axis=1) - float(obstacle["r"]))
+            if not np.any(boundary_error < hit_tolerance):
+                continue
+            if miss_rate > 0.0 and float(self.np_random.uniform()) < miss_rate:
+                continue
+            visible_obstacles.append(
+                {
+                    "c": center.copy(),
+                    "r": float(obstacle["r"]),
+                    "v": np.asarray(obstacle.get("v", np.zeros(3, dtype=np.float64)), dtype=np.float64).reshape(3).copy(),
+                }
+            )
+        return visible_obstacles, safe_zone
+
+    def _apply_noise(self, value: np.ndarray | float, std: float, nonnegative: bool = False):
+        if std <= 0.0:
+            return value
+
+        arr = np.asarray(value, dtype=np.float64)
+        if not np.isfinite(arr).all():
+            return value
+
+        noisy = arr + self.np_random.normal(0.0, std, size=arr.shape)
+        if nonnegative:
+            noisy = np.maximum(noisy, 0.0)
+        if np.isscalar(value):
+            return float(np.asarray(noisy).reshape(-1)[0])
+        return noisy
+
+    def _fallback_visible_obstacle(self) -> dict:
+        sensor_range = float(self.sensor_cfg.get("range", self.obs_clip))
+        return {
+            "c": np.full(3, np.nan, dtype=np.float64),
+            "r": 0.0,
+            "v": np.zeros(3, dtype=np.float64),
+            "distance": sensor_range,
+            "clearance": sensor_range,
+            "rel_world": np.array([sensor_range, 0.0, 0.0], dtype=np.float64),
+            "rel_vel_world": np.zeros(3, dtype=np.float64),
+        }
 
     def _reset_scene_bounds(self, start_xyz: np.ndarray, goal_xyz: np.ndarray) -> None:
         margin = float(self.cfg["spawn"].get("scene_margin", 3.0))
@@ -254,36 +356,59 @@ class FishAvoidEnv(gym.Env):
         goal_rel_world = self.goal_xyz - position_world
         goal_rel_body = rotate_world_to_body(goal_rel_world, rotation)
         goal_dist = float(np.linalg.norm(goal_rel_world))
+        visible_obstacles, safe_zone = self._collect_visible_obstacles(position_world, velocity_world)
 
-        nearest = nearest_obstacle_info(position_world, velocity_world, self.obstacles, self.fish_radius)
-        obs_rel_body = rotate_world_to_body(nearest["rel_world"], rotation)
-        obs_rel_vel_body = rotate_world_to_body(nearest["rel_vel_world"], rotation)
+        nearest_visible = nearest_obstacle_info(position_world, velocity_world, visible_obstacles, self.fish_radius)
+        if not np.isfinite(nearest_visible["distance"]):
+            nearest_visible = self._fallback_visible_obstacle()
+        nearest_true = nearest_obstacle_info(position_world, velocity_world, self.obstacles, self.fish_radius)
+        obs_rel_body = rotate_world_to_body(nearest_visible["rel_world"], rotation)
+        obs_rel_vel_body = rotate_world_to_body(nearest_visible["rel_vel_world"], rotation)
+        velocity_std = float(self.observation_noise_cfg.get("velocity_std", 0.0))
+        angular_rate_std = float(self.observation_noise_cfg.get("angular_rate_std", 0.0))
+        goal_rel_std = float(self.observation_noise_cfg.get("goal_rel_std", 0.0))
+        goal_dist_std = float(self.observation_noise_cfg.get("goal_dist_std", 0.0))
+        obstacle_rel_std = float(self.observation_noise_cfg.get("obstacle_rel_std", 0.0))
+        obstacle_vel_std = float(self.observation_noise_cfg.get("obstacle_vel_std", 0.0))
+        clearance_std = float(self.observation_noise_cfg.get("clearance_std", 0.0))
+        radius_std = float(self.observation_noise_cfg.get("radius_std", 0.0))
+        hist_std = float(self.observation_noise_cfg.get("hist_std", 0.0))
+
+        lin_vel_obs = self._apply_noise(self.state[[VX, VY, VZ]], velocity_std)
+        ang_vel_obs = self._apply_noise(self.state[[WX, WY, WZ]], angular_rate_std)
+        goal_rel_body_obs = self._apply_noise(goal_rel_body, goal_rel_std)
+        goal_dist_obs = self._apply_noise(goal_dist, goal_dist_std, nonnegative=True)
+        obs_rel_body_obs = self._apply_noise(obs_rel_body, obstacle_rel_std)
+        obs_rel_vel_body_obs = self._apply_noise(obs_rel_vel_body, obstacle_vel_std)
+        clearance_obs = self._apply_noise(nearest_visible["clearance"], clearance_std)
+        radius_obs = self._apply_noise(nearest_visible["r"], radius_std, nonnegative=True)
+        hist_obs = self._apply_noise(self.hist, hist_std)
 
         obs = np.array(
             [
-                self.state[VX],
-                self.state[VY],
-                self.state[VZ],
-                self.state[WX],
-                self.state[WY],
-                self.state[WZ],
-                goal_rel_body[0],
-                goal_rel_body[1],
-                goal_rel_body[2],
-                goal_dist,
-                obs_rel_body[0],
-                obs_rel_body[1],
-                obs_rel_body[2],
-                nearest["clearance"],
-                nearest["r"],
-                obs_rel_vel_body[0],
-                obs_rel_vel_body[1],
-                obs_rel_vel_body[2],
-                self.hist[0],
-                self.hist[1],
-                self.hist[2],
-                self.hist[3],
-                self.hist[4],
+                lin_vel_obs[0],
+                lin_vel_obs[1],
+                lin_vel_obs[2],
+                ang_vel_obs[0],
+                ang_vel_obs[1],
+                ang_vel_obs[2],
+                goal_rel_body_obs[0],
+                goal_rel_body_obs[1],
+                goal_rel_body_obs[2],
+                goal_dist_obs,
+                obs_rel_body_obs[0],
+                obs_rel_body_obs[1],
+                obs_rel_body_obs[2],
+                clearance_obs,
+                radius_obs,
+                obs_rel_vel_body_obs[0],
+                obs_rel_vel_body_obs[1],
+                obs_rel_vel_body_obs[2],
+                hist_obs[0],
+                hist_obs[1],
+                hist_obs[2],
+                hist_obs[3],
+                hist_obs[4],
             ],
             dtype=np.float64,
         )
@@ -293,9 +418,14 @@ class FishAvoidEnv(gym.Env):
             "goal": self.goal_xyz.copy(),
             "goal_rel_world": goal_rel_world,
             "goal_rel_body": goal_rel_body,
-            "nearest_obstacle": nearest,
+            "nearest_obstacle": nearest_true,
+            "nearest_obstacle_visible": nearest_visible,
+            "visible_obstacles": visible_obstacles,
+            "visible_obstacle_count": len(visible_obstacles),
             "velocity_world": velocity_world,
             "backend": self.backend,
+            "current_world": self.current_world.copy(),
+            "sensor_hits": int(np.count_nonzero(safe_zone["is_blocked"])),
         }
         return obs, info
 
@@ -306,6 +436,7 @@ class FishAvoidEnv(gym.Env):
         self.t_k = 0.0
         self.prev_action = np.zeros(3, dtype=np.float64)
         self.hist = self.trim_refs.copy()
+        self.current_world = self._sample_current_world()
         self.ctrl_state = {
             "e_theta_prev": 0.0,
             "e_theta_int": 0.0,
@@ -350,8 +481,40 @@ class FishAvoidEnv(gym.Env):
             self.fin_f,
         )
         self.t_k += self.dt
+        if not np.isfinite(next_state).all() or not np.isfinite(next_hist).all():
+            obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+            info = {
+                "goal_dist": float("inf"),
+                "goal": self.goal_xyz.copy(),
+                "goal_rel_world": np.full(3, np.nan, dtype=np.float64),
+                "goal_rel_body": np.full(3, np.nan, dtype=np.float64),
+                "nearest_obstacle": self._fallback_visible_obstacle(),
+                "nearest_obstacle_visible": self._fallback_visible_obstacle(),
+                "visible_obstacles": [],
+                "visible_obstacle_count": 0,
+                "velocity_world": np.zeros(3, dtype=np.float64),
+                "backend": self.backend,
+                "current_world": self.current_world.copy(),
+                "sensor_hits": 0,
+            }
+            info.update(
+                {
+                    "action_ref": action_ref,
+                    "cmd_vel_body": cmd_vel_body,
+                    "cmd_vel_world": cmd_vel_world,
+                    "reward_terms": {"numerical_failure": -self.cfg["reward"]["collision"]},
+                    "reached_goal": False,
+                    "collided": False,
+                    "numerical_issue": True,
+                    "t_k": self.t_k,
+                }
+            )
+            return obs, -self.cfg["reward"]["collision"], True, False, info
+
         self.state = next_state
         self.hist = next_hist
+        self._update_current_world()
+        self.state[[PX, PY, PZ]] = self.state[[PX, PY, PZ]] + self.current_world * self.dt
         self._update_obstacles()
 
         obs, info = self._build_obs()

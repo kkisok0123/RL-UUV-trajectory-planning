@@ -42,6 +42,18 @@ class RLLocalPlanner:
     def reset(self) -> None:
         self.prev_action[:] = 0.0
 
+    def _fallback_nearest_obstacle(self) -> dict:
+        sensor_range = float(self.obs_clip)
+        return {
+            "c": np.full(3, np.nan, dtype=np.float64),
+            "r": 0.0,
+            "v": np.zeros(3, dtype=np.float64),
+            "distance": sensor_range,
+            "clearance": sensor_range,
+            "rel_world": np.array([sensor_range, 0.0, 0.0], dtype=np.float64),
+            "rel_vel_world": np.zeros(3, dtype=np.float64),
+        }
+
     def _rotation_body_to_world(self, fish_state: np.ndarray) -> np.ndarray:
         fish_state = np.asarray(fish_state, dtype=np.float64)
         return quaternion_to_rotation_matrix(
@@ -71,6 +83,8 @@ class RLLocalPlanner:
         goal_dist = float(np.linalg.norm(goal_rel_world))
 
         nearest = nearest_obstacle_info(position_world, velocity_world, visible_obstacles, self.fish_radius)
+        if not np.isfinite(nearest["distance"]):
+            nearest = self._fallback_nearest_obstacle()
         obs_rel_body = rotate_world_to_body(nearest["rel_world"], rotation)
         obs_rel_vel_body = rotate_world_to_body(nearest["rel_vel_world"], rotation)
 

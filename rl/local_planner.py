@@ -20,10 +20,13 @@ class RLLocalPlanner:
     def __init__(self, model_path: str | Path | None = None, config: dict | None = None):
         self.config = build_fish_env_config() if config is None else config
         if model_path is None:
-            model_path = (
-                Path(__file__).resolve().parents[1] / "artifacts" / "models" / "best_model.zip"
-            )
+            model_dir = Path(__file__).resolve().parents[1] / "artifacts" / "models"
+            latest_model = model_dir / "latest_model.zip"
+            best_model = model_dir / "best_model.zip"
+            model_path = latest_model if latest_model.exists() else best_model
         self.model_path = Path(model_path)
+        if not self.model_path.exists():
+            raise FileNotFoundError(f"RL model not found: {self.model_path}")
         self.model = PPO.load(str(self.model_path))
         expected_obs_shape = (23,)
         if tuple(self.model.observation_space.shape) != expected_obs_shape:

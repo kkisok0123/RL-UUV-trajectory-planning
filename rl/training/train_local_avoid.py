@@ -9,7 +9,6 @@ import webbrowser
 from pathlib import Path
 
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
 
@@ -19,6 +18,7 @@ if str(ROOT) not in sys.path:
 
 from rl.configs.ppo_fish import build_ppo_config
 from rl.envs.fish_avoid_env import FishAvoidEnv
+from rl.training.collision_eval_callback import CollisionAwareEvalCallback
 
 
 def make_env():
@@ -71,13 +71,13 @@ def main() -> None:
     train_env = DummyVecEnv([make_env for _ in range(cfg["n_envs"])])
     eval_env = DummyVecEnv([make_env])
 
-    eval_callback = EvalCallback(
+    eval_callback = CollisionAwareEvalCallback(
         eval_env,
-        best_model_save_path=str(model_dir),
-        log_path=str(log_dir),
+        best_model_save_path=model_dir,
         eval_freq=cfg["eval_freq"],
         n_eval_episodes=cfg["n_eval_episodes"],
         deterministic=True,
+        verbose=1,
     )
 
     model = PPO(

@@ -74,6 +74,7 @@ class FishAvoidEnv(gym.Env):
         self.sensor_cfg = deepcopy(self.cfg.get("sensor", {}))
         self.observation_noise_cfg = deepcopy(self.cfg.get("observation_noise", {}))
         self.disturbance_cfg = deepcopy(self.cfg.get("disturbance", {}))
+        self.termination_cfg = deepcopy(self.cfg.get("termination", {}))
 
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
         self.observation_space = spaces.Box(
@@ -140,15 +141,18 @@ class FishAvoidEnv(gym.Env):
                 self.cfg["spawn"]["dynamic_speed_high"],
             )
         )
-        lateral_sign = -1.0 if bool(self.np_random.integers(0, 2)) else 1.0
+        local_direction = self.np_random.normal(0.0, 1.0, size=3).astype(np.float64)
+        local_direction *= np.array([1.0, 1.15, 0.9], dtype=np.float64)
         direction = (
-            self.np_random.uniform(-0.30, 0.20) * np.asarray(corridor_dir, dtype=np.float64).reshape(3)
-            + lateral_sign * self.np_random.uniform(0.85, 1.20) * np.asarray(side, dtype=np.float64).reshape(3)
-            + self.np_random.uniform(-0.25, 0.25) * np.asarray(lift, dtype=np.float64).reshape(3)
+            local_direction[0] * np.asarray(corridor_dir, dtype=np.float64).reshape(3)
+            + local_direction[1] * np.asarray(side, dtype=np.float64).reshape(3)
+            + local_direction[2] * np.asarray(lift, dtype=np.float64).reshape(3)
         )
         direction_norm = float(np.linalg.norm(direction))
         if direction_norm < 1e-8:
-            direction = np.asarray(side, dtype=np.float64).reshape(3)
+            fallback = self.np_random.normal(0.0, 1.0, size=3).astype(np.float64)
+            fallback_norm = float(np.linalg.norm(fallback))
+            direction = fallback / max(fallback_norm, 1e-8)
         else:
             direction = direction / direction_norm
         return speed * direction
@@ -505,6 +509,7 @@ class FishAvoidEnv(gym.Env):
                     "reward_terms": {"numerical_failure": -self.cfg["reward"]["collision"]},
                     "reached_goal": False,
                     "collided": False,
+                    "unsafe_terminated": False,
                     "numerical_issue": True,
                     "t_k": self.t_k,
                 }
@@ -539,8 +544,14 @@ class FishAvoidEnv(gym.Env):
         self.prev_action = action
 
         reached_goal = goal_dist < self.cfg["goal_radius"]
-        collided = clearance <= 0.0
-        terminated = reached_goal or collided
+        collision_clearance = float(self.termination_cfg.get("collision_clearance", 0.0))
+        unsafe_clearance = float(self.termination_cfg.get("unsafe_clearance", collision_clearance))
+        collided = clearance <= collision_clearance
+        unsafe_terminated = (clearance <= unsafe_clearance) and not collided
+        if unsafe_terminated:
+            terms["unsafe_termination"] = -float(self.cfg["reward"].get("unsafe_termination", 0.0))
+            reward += terms["unsafe_termination"]
+        terminated = reached_goal or collided or unsafe_terminated
         truncated = self.step_count >= self.max_steps
 
         info.update(
@@ -551,6 +562,7 @@ class FishAvoidEnv(gym.Env):
                 "reward_terms": terms,
                 "reached_goal": reached_goal,
                 "collided": collided,
+                "unsafe_terminated": unsafe_terminated,
                 "t_k": self.t_k,
             }
         )

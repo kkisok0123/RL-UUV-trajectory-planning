@@ -469,7 +469,7 @@ def plot_hybrid_result(
         frames=len(valid_path),
         interval=15,
         blit=False,
-        repeat=True,
+        repeat=False,
     )
     fig._robot_anim = anim
     _LIVE_ANIMATIONS.append(anim)
@@ -536,5 +536,236 @@ def plot_hybrid_result(
         axes_att[3].grid(True)
         axes_att[3].legend(loc="best")
         fig_att.tight_layout()
+
+
+def plot_hybrid_comparison_result(
+    rl_result: dict,
+    mpc_result: dict,
+    static_obs: list[dict],
+    goal: np.ndarray,
+    save_path: str | None = None,
+    fps: int = 20,
+) -> None:
+    traj_global = np.asarray(rl_result["traj_global"]["xyz"], dtype=np.float64)
+    rl_path = np.asarray(rl_result["path_hist"], dtype=np.float64)
+    mpc_path = np.asarray(mpc_result["path_hist"], dtype=np.float64)
+    rl_path = rl_path[np.isfinite(rl_path).all(axis=1)]
+    mpc_path = mpc_path[np.isfinite(mpc_path).all(axis=1)]
+    if rl_path.size == 0:
+        rl_path = np.zeros((1, 3), dtype=np.float64)
+    if mpc_path.size == 0:
+        mpc_path = np.zeros((1, 3), dtype=np.float64)
+
+    dyn_obs_hist = np.asarray(rl_result.get("dyn_obs_hist", []), dtype=np.float64)
+    dyn_obs_radii = np.asarray(rl_result.get("dyn_obs_radii", []), dtype=np.float64)
+    if dyn_obs_hist.ndim != 3:
+        dyn_obs_hist = np.zeros((1, 0, 3), dtype=np.float64)
+    if dyn_obs_radii.ndim != 1:
+        dyn_obs_radii = np.zeros((0,), dtype=np.float64)
+
+    bounds_points: list[np.ndarray] = [
+        traj_global,
+        rl_path,
+        mpc_path,
+        np.asarray(goal, dtype=np.float64).reshape(1, 3),
+    ]
+    if static_obs:
+        static_bounds = []
+        for obstacle in static_obs:
+            center = np.asarray(obstacle["c"], dtype=np.float64).reshape(3)
+            radius = float(obstacle["r"])
+            static_bounds.extend([center - radius, center + radius])
+        bounds_points.append(np.asarray(static_bounds, dtype=np.float64))
+    if dyn_obs_hist.size > 0 and dyn_obs_hist.shape[1] > 0:
+        for obs_idx in range(dyn_obs_hist.shape[1]):
+            radius = float(dyn_obs_radii[obs_idx]) if obs_idx < dyn_obs_radii.size else 0.0
+            bounds_points.append(dyn_obs_hist[:, obs_idx, :] - radius)
+            bounds_points.append(dyn_obs_hist[:, obs_idx, :] + radius)
+
+    axis_mins, axis_maxs = _axis_limits_from_points(bounds_points, min_span=2.0, pad_ratio=0.08)
+    fig = plt.figure(figsize=(12, 10), facecolor="white")
+    ax = fig.add_subplot(111, projection="3d")
+    ax.set_title("Hybrid Trajectory Planning Comparison")
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.set_zlabel("Z (m)")
+    _set_3d_axis_scale(ax, axis_mins, axis_maxs)
+    ax.set_autoscale_on(False)
+    try:
+        ax.set_proj_type("ortho")
+    except AttributeError:
+        pass
+    ax.view_init(elev=30.0, azim=-37.5)
+    ax.grid(True)
+
+    ax.plot(
+        traj_global[:, 0],
+        traj_global[:, 1],
+        traj_global[:, 2],
+        "k--",
+        linewidth=1.4,
+        label="Global Path",
+    )
+
+    u, v = np.mgrid[0 : 2 * np.pi : 20j, 0 : np.pi : 12j]
+    for obstacle in static_obs:
+        x, y, z = _sphere_mesh(np.asarray(obstacle["c"], dtype=np.float64), float(obstacle["r"]), u, v)
+        ax.plot_surface(
+            x,
+            y,
+            z,
+            color=(0.8, 0.2, 0.2),
+            alpha=0.55,
+            linewidth=0.0,
+            edgecolor="none",
+        )
+
+    dyn_surfaces = []
+    dyn_trails = []
+    if dyn_obs_hist.shape[1] > 0:
+        for obs_idx in range(dyn_obs_hist.shape[1]):
+            x, y, z = _sphere_mesh(dyn_obs_hist[0, obs_idx], float(dyn_obs_radii[obs_idx]), u, v)
+            dyn_surfaces.append(
+                ax.plot_surface(
+                    x,
+                    y,
+                    z,
+                    color=(0.2, 0.2, 0.9),
+                    alpha=0.55,
+                    linewidth=0.0,
+                    edgecolor="none",
+                )
+            )
+            trail, = ax.plot(
+                dyn_obs_hist[:1, obs_idx, 0],
+                dyn_obs_hist[:1, obs_idx, 1],
+                dyn_obs_hist[:1, obs_idx, 2],
+                color=(0.2, 0.2, 0.9),
+                linewidth=1.2,
+                alpha=0.8,
+            )
+            dyn_trails.append(trail)
+
+    ax.scatter(
+        [goal[0]],
+        [goal[1]],
+        [goal[2]],
+        c="y",
+        s=180,
+        marker="p",
+        edgecolors="k",
+        label="Goal",
+    )
+
+    rl_robot = ax.scatter(
+        [rl_path[0, 0]],
+        [rl_path[0, 1]],
+        [rl_path[0, 2]],
+        c=[(0.90, 0.25, 0.20)],
+        s=120,
+        marker="o",
+        edgecolors="k",
+        label="RL Robot",
+    )
+    mpc_robot = ax.scatter(
+        [mpc_path[0, 0]],
+        [mpc_path[0, 1]],
+        [mpc_path[0, 2]],
+        c=[(0.15, 0.40, 0.90)],
+        s=120,
+        marker="^",
+        edgecolors="k",
+        label="MPC Robot",
+    )
+    rl_path_plot, = ax.plot(
+        rl_path[:1, 0],
+        rl_path[:1, 1],
+        rl_path[:1, 2],
+        color=(0.95, 0.40, 0.15),
+        linewidth=2.8,
+        label="RL Path",
+    )
+    mpc_path_plot, = ax.plot(
+        mpc_path[:1, 0],
+        mpc_path[:1, 1],
+        mpc_path[:1, 2],
+        color=(0.10, 0.45, 0.95),
+        linewidth=2.6,
+        label="MPC Path",
+    )
+    ax.legend(loc="upper right")
+
+    rl_mode_hist = list(rl_result.get("settings", {}).get("mode", []))
+    mpc_mode_hist = list(mpc_result.get("settings", {}).get("mode", []))
+
+    def _get_pos(path_hist: np.ndarray, frame_idx: int) -> np.ndarray:
+        return path_hist[min(frame_idx, len(path_hist) - 1)]
+
+    def _get_mode(mode_hist: list[str], frame_idx: int) -> str:
+        if not mode_hist:
+            return "GLOBAL_TRACKING"
+        if frame_idx <= 0:
+            return "GLOBAL_TRACKING"
+        return mode_hist[min(frame_idx - 1, len(mode_hist) - 1)]
+
+    def _update_dyn_obstacles(frame_idx: int):
+        nonlocal dyn_surfaces
+        if not dyn_surfaces:
+            return
+        hist_idx = min(frame_idx, dyn_obs_hist.shape[0] - 1)
+        for surface in dyn_surfaces:
+            surface.remove()
+        dyn_surfaces = []
+        for obs_idx in range(dyn_obs_hist.shape[1]):
+            x, y, z = _sphere_mesh(dyn_obs_hist[hist_idx, obs_idx], float(dyn_obs_radii[obs_idx]), u, v)
+            dyn_surfaces.append(
+                ax.plot_surface(
+                    x,
+                    y,
+                    z,
+                    color=(0.2, 0.2, 0.9),
+                    alpha=0.55,
+                    linewidth=0.0,
+                    edgecolor="none",
+                )
+            )
+            dyn_trails[obs_idx].set_data(
+                dyn_obs_hist[: hist_idx + 1, obs_idx, 0],
+                dyn_obs_hist[: hist_idx + 1, obs_idx, 1],
+            )
+            dyn_trails[obs_idx].set_3d_properties(dyn_obs_hist[: hist_idx + 1, obs_idx, 2])
+
+    def _update(frame_idx: int):
+        rl_pos = _get_pos(rl_path, frame_idx)
+        mpc_pos = _get_pos(mpc_path, frame_idx)
+
+        rl_robot._offsets3d = ([rl_pos[0]], [rl_pos[1]], [rl_pos[2]])
+        mpc_robot._offsets3d = ([mpc_pos[0]], [mpc_pos[1]], [mpc_pos[2]])
+        rl_path_plot.set_data(rl_path[: min(frame_idx + 1, len(rl_path)), 0], rl_path[: min(frame_idx + 1, len(rl_path)), 1])
+        rl_path_plot.set_3d_properties(rl_path[: min(frame_idx + 1, len(rl_path)), 2])
+        mpc_path_plot.set_data(mpc_path[: min(frame_idx + 1, len(mpc_path)), 0], mpc_path[: min(frame_idx + 1, len(mpc_path)), 1])
+        mpc_path_plot.set_3d_properties(mpc_path[: min(frame_idx + 1, len(mpc_path)), 2])
+        _update_dyn_obstacles(frame_idx)
+        _set_3d_axis_scale(ax, axis_mins, axis_maxs)
+
+        rl_mode = _get_mode(rl_mode_hist, frame_idx)
+        mpc_mode = _get_mode(mpc_mode_hist, frame_idx)
+        ax.set_title(f"Step {frame_idx} | RL: {rl_mode} | MPC: {mpc_mode}")
+        return rl_robot, mpc_robot, rl_path_plot, mpc_path_plot, *dyn_trails, *dyn_surfaces
+
+    frames = max(len(rl_path), len(mpc_path), dyn_obs_hist.shape[0])
+    anim = FuncAnimation(
+        fig,
+        _update,
+        frames=frames,
+        interval=15,
+        blit=False,
+        repeat=False,
+    )
+    fig._robot_anim = anim
+    _LIVE_ANIMATIONS.append(anim)
+    if save_path:
+        _save_animation(anim, save_path, fps=fps)
+    plt.tight_layout()
 
     plt.show()

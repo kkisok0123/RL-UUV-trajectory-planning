@@ -20,6 +20,7 @@ def main(episodes: int = 5) -> None:
     rewards = []
     successes = 0
     collisions = 0
+    unsafe_terminations = 0
     for _ in range(episodes):
         obs, _ = env.reset()
         done = False
@@ -32,11 +33,13 @@ def main(episodes: int = 5) -> None:
         rewards.append(episode_reward)
         successes += int(info["reached_goal"])
         collisions += int(info["collided"])
+        unsafe_terminations += int(info.get("unsafe_terminated", False))
 
     print(f"episodes={episodes}")
     print(f"mean_reward={sum(rewards) / len(rewards):.3f}")
     print(f"success_rate={successes / episodes:.3f}")
     print(f"collision_rate={collisions / episodes:.3f}")
+    print(f"unsafe_termination_rate={unsafe_terminations / episodes:.3f}")
 
 
 if __name__ == "__main__":

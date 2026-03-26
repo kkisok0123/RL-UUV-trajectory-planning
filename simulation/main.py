@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import sys
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 
@@ -13,12 +14,13 @@ if __package__ in (None, ""):
         sys.path.insert(0, str(repo_root))
 
 from dynamics_wrapper import step as dynamics_step
-from dynamics_wrapper.indices import PX, PY, PZ, Q0, Q1, Q2, Q3
+from dynamics_wrapper.indices import PX, PY, PZ, Q0, Q1, Q2, Q3, VX, VY, VZ
 from rl.configs.fish_env import build_fish_env_config
 from rl.envs.geometry import nearest_obstacle_info
 from rl.local_planner import RLLocalPlanner
 from simulation.global_planning.los import los_guidance_3d
 from simulation.local_planning.fin_controller import fin_controller
+from simulation.local_planning.mpc_planner import MPCLocalPlanner
 from simulation.local_planning.path_utils import find_local_target
 from simulation.local_planning.sensor import get_visible_obstacles
 
@@ -213,6 +215,92 @@ def _build_reference_path_from_tracking_template(start: np.ndarray, goal: np.nda
     return {"waypoints": waypoints, "xyz": xyz}
 
 
+def _build_default_obstacles() -> tuple[list[dict], list[dict]]:
+    static_obs = [
+        _make_obstacle([16.5, 2.05, -1.73], 2),
+        _make_obstacle([48.0, 3.7, 4.2], 0.65),
+    ]
+    dyn_obs = [
+        _make_dynamic_obstacle(
+            anchor=[31.5, 1.20, 0.55],
+            radius=2.5,
+            amplitude=[2, 4, 1.5],
+            frequency=[0.11, 0.19, 0.11],
+            phase=[0.20, 1.05, -0.35],
+        ),
+        _make_dynamic_obstacle(
+            anchor=[35.0, -1.10, 0.10],
+            radius=1.6,
+            amplitude=[0.20, 1.20, 1.80],
+            frequency=[0.10, 0.15, 0.13],
+            phase=[1.10, -0.45, 0.60],
+        ),
+    ]
+    return static_obs, dyn_obs
+
+
+def _build_sensor_params(cfg: HybridSimulationConfig) -> dict:
+    return {
+        "range": 8,
+        "fov_angle": 60,
+        "danger_distance_enter": 6.0,
+        "danger_distance_exit": 4.0,
+        "dt": cfg.dt,
+        "num_rays": 100,
+    }
+
+
+def _build_hybrid_scene(cfg: HybridSimulationConfig) -> dict:
+    traj_global = _build_reference_path_from_tracking_template(
+        np.zeros(3, dtype=np.float64),
+        np.zeros(3, dtype=np.float64),
+    )
+    path_waypoints = traj_global["waypoints"]
+    path_xyz = traj_global["xyz"]
+    cruise_speed = cfg.cruise_speed
+    initial_tangent = _path_tangent(path_xyz, 0)
+    initial_tangent = initial_tangent / max(np.linalg.norm(initial_tangent), 1e-8)
+    fs = {"p": path_waypoints[0].copy(), "v": cruise_speed * initial_tangent, "a": np.zeros(3)}
+    fg = {"p": path_waypoints[-1].copy(), "v": np.zeros(3), "a": np.zeros(3)}
+    scene_min, scene_max = _scene_bounds_from_path(path_xyz)
+    los_params = {"Delta": 2.5, "k_p": 0.5}
+    static_obs, dyn_obs = _build_default_obstacles()
+    sensor_params = _build_sensor_params(cfg)
+    return {
+        "traj_global": traj_global,
+        "fs": fs,
+        "fg": fg,
+        "scene_min": scene_min,
+        "scene_max": scene_max,
+        "los_params": los_params,
+        "static_obs": static_obs,
+        "dyn_obs": dyn_obs,
+        "sensor_params": sensor_params,
+    }
+
+
+def _default_ctrl_state() -> dict:
+    return {
+        "e_theta_prev": 0.0,
+        "e_theta_int": 0.0,
+        "e_psi_prev": 0.0,
+        "e_psi_int": 0.0,
+    }
+
+
+def _build_local_planner_timing(sa_settings: dict, steps_executed: int) -> dict:
+    local_decision_times = np.asarray(sa_settings["local_decision_time_ms"][:steps_executed], dtype=np.float64)
+    valid_local_times = local_decision_times[np.isfinite(local_decision_times)]
+    return {
+        "decision_time_ms": local_decision_times.copy(),
+        "decision_steps": np.flatnonzero(np.isfinite(local_decision_times)).astype(np.int64) + 1,
+        "count": int(valid_local_times.size),
+        "mean_ms": float(np.mean(valid_local_times)) if valid_local_times.size else np.nan,
+        "max_ms": float(np.max(valid_local_times)) if valid_local_times.size else np.nan,
+        "min_ms": float(np.min(valid_local_times)) if valid_local_times.size else np.nan,
+    }
+
+
 def _scene_bounds_from_path(
     path_xyz: np.ndarray,
     margin: np.ndarray | float | None = None,
@@ -276,38 +364,17 @@ def _run_hybrid_los_rl_simulation(
     cfg = HybridSimulationConfig() if sim_config is None else sim_config
     env_cfg = build_fish_env_config()
     sa_settings: dict[str, np.ndarray | list] = {}
-
-    traj_global = _build_reference_path_from_tracking_template(
-        np.zeros(3, dtype=np.float64),
-        np.zeros(3, dtype=np.float64),
-    )
-    path_waypoints = traj_global["waypoints"]
+    scene = _build_hybrid_scene(cfg)
+    traj_global = scene["traj_global"]
+    fs = scene["fs"]
+    fg = scene["fg"]
+    scene_min = scene["scene_min"]
+    scene_max = scene["scene_max"]
+    los_params = scene["los_params"]
+    static_obs = scene["static_obs"]
+    dyn_obs = scene["dyn_obs"]
+    sensor_params = scene["sensor_params"]
     path_xyz = traj_global["xyz"]
-
-    cruise_speed = cfg.cruise_speed
-    initial_tangent = _path_tangent(path_xyz, 0)
-    initial_tangent = initial_tangent / max(np.linalg.norm(initial_tangent), 1e-8)
-    fs = {"p": path_waypoints[0].copy(), "v": cruise_speed * initial_tangent, "a": np.zeros(3)}
-    fg = {"p": path_waypoints[-1].copy(), "v": np.zeros(3), "a": np.zeros(3)}
-    scene_min, scene_max = _scene_bounds_from_path(path_xyz)
-
-    los_params = {"Delta": 2.5, "k_p": 0.5}
-    static_obs = [
-        # Static obstacle placed on the first half of the reference path.
-        _make_obstacle([16.5, 2.05, -1.73], 2),
-        # Small obstacle near the terminal region.
-        _make_obstacle([48.0, 3.7, 4.2], 0.65),
-    ]
-    dyn_obs = [
-        # Dynamic obstacle follows a compound oscillatory trajectory in the second-half corridor.
-        _make_dynamic_obstacle(
-            anchor=[31.5, 1.20, 0.55],
-            radius=2.5,
-            amplitude=[2, 4, 1.5],
-            frequency=[0.12, 0.22, 0.12],
-            phase=[0.20, 1.05, -0.35],
-        ),
-    ]
 
     s_max = traj_global["xyz"].shape[0]
     s_grid = np.arange(1, s_max + 1, dtype=np.float64)
@@ -315,28 +382,14 @@ def _run_hybrid_los_rl_simulation(
     fy = lambda s: np.interp(s, s_grid, traj_global["xyz"][:, 1])
     fz = lambda s: np.interp(s, s_grid, traj_global["xyz"][:, 2])
 
-    sensor_params = {
-        "range": 8,
-        "fov_angle": 60,
-        "danger_distance_enter": 6.0,
-        "danger_distance_exit": 4.0,
-        "dt": cfg.dt,
-        "num_rays": 100,
-    }
-
     fish_state = np.zeros(13, dtype=np.float64)
     fish_state[:3] = np.zeros(3, dtype=np.float64)
-    fish_state[Q0 : Q3 + 1] = _quat_from_forward_vector(initial_tangent)
+    fish_state[Q0 : Q3 + 1] = _quat_from_forward_vector(fs["v"])
     fish_state[[PX, PY, PZ]] = fs["p"]
     body_params = np.asarray(env_cfg["body_params"], dtype=np.float64).copy()
     fin_params = np.asarray(env_cfg["fin_params"], dtype=np.float64).copy()
 
-    ctrl_state = {
-        "e_theta_prev": 0.0,
-        "e_theta_int": 0.0,
-        "e_psi_prev": 0.0,
-        "e_psi_int": 0.0,
-    }
+    ctrl_state = _default_ctrl_state()
     hist = np.zeros(5, dtype=np.float64)
     c_a = float(env_cfg["c_A"])
     fin_f = float(env_cfg["fin_f"])
@@ -383,6 +436,7 @@ def _run_hybrid_los_rl_simulation(
     sa_settings["delta_ref"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
     sa_settings["mode"] = []
     sa_settings["local_planner_success"] = []
+    sa_settings["local_decision_time_ms"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
 
     for k in range(1, cfg.max_steps + 1):
         t_k = (k - 1) * cfg.dt
@@ -430,6 +484,7 @@ def _run_hybrid_los_rl_simulation(
         if mode == "LOCAL_AVOIDANCE":
             local_target = find_local_target(traj_global, curr_pos, cfg.local_lookahead)
             local_target_log = np.asarray(local_target, dtype=np.float64).copy()
+            decision_tic = perf_counter()
             action_ref, _, _, cmd_vel_global, ctrl_state = local_planner.plan(
                 fish_state,
                 hist,
@@ -439,6 +494,7 @@ def _run_hybrid_los_rl_simulation(
                 cfg.dt,
                 fish_params,
             )
+            sa_settings["local_decision_time_ms"][k - 1] = (perf_counter() - decision_tic) * 1000.0
             controller_snapshot = ctrl_state
             sa_settings["cmd_vel_des"][:, k - 1] = cmd_vel_global
             title_hist.append(
@@ -519,7 +575,7 @@ def _run_hybrid_los_rl_simulation(
 
         curr_pos = fish_state[[PX, PY, PZ]].copy()
         rie = _rotation_body_to_world(fish_state)
-        robot_vel = rie.T @ fish_state[:3]
+        robot_vel = rie.T @ fish_state[[VX, VY, VZ]]
         sa_settings["vel_act"][:, k - 1] = robot_vel
         path_hist.append(curr_pos.copy())
         dyn_obs_hist.append(np.asarray([obs["c"].copy() for obs in dyn_obs], dtype=np.float64))
@@ -574,6 +630,7 @@ def _run_hybrid_los_rl_simulation(
         "final_hist": hist,
         "local_planner_kind": "rl",
     }
+    result["local_planner_timing"] = _build_local_planner_timing(sa_settings, steps_executed)
     result["tracking_metrics"] = _compute_tracking_metrics(sa_settings, fish_params, steps_executed)
     if visualize:
         from simulation.visualization import plot_hybrid_result
@@ -600,19 +657,373 @@ def run_hybrid_los_rl_simulation(
     )
 
 
+def _run_hybrid_los_mpc_simulation(
+    visualize: bool = False,
+    animation_path: str | None = None,
+    animation_fps: int = 20,
+    controller_params_override: dict | None = None,
+    sim_config: HybridSimulationConfig | None = None,
+) -> dict:
+    cfg = HybridSimulationConfig() if sim_config is None else sim_config
+    env_cfg = build_fish_env_config()
+    scene = _build_hybrid_scene(cfg)
+    traj_global = scene["traj_global"]
+    fs = scene["fs"]
+    fg = scene["fg"]
+    scene_min = scene["scene_min"]
+    scene_max = scene["scene_max"]
+    los_params = scene["los_params"]
+    static_obs = scene["static_obs"]
+    dyn_obs = scene["dyn_obs"]
+    sensor_params = scene["sensor_params"]
+    sa_settings: dict[str, np.ndarray | list] = {}
+
+    s_max = traj_global["xyz"].shape[0]
+    s_grid = np.arange(1, s_max + 1, dtype=np.float64)
+    fx = lambda s: np.interp(s, s_grid, traj_global["xyz"][:, 0])
+    fy = lambda s: np.interp(s, s_grid, traj_global["xyz"][:, 1])
+    fz = lambda s: np.interp(s, s_grid, traj_global["xyz"][:, 2])
+
+    fish_state = np.zeros(13, dtype=np.float64)
+    fish_state[:3] = np.zeros(3, dtype=np.float64)
+    fish_state[Q0 : Q3 + 1] = _quat_from_forward_vector(fs["v"])
+    fish_state[[PX, PY, PZ]] = fs["p"]
+    body_params = np.asarray(env_cfg["body_params"], dtype=np.float64).copy()
+    fin_params = np.asarray(env_cfg["fin_params"], dtype=np.float64).copy()
+
+    ctrl_state = _default_ctrl_state()
+    hist = np.zeros(5, dtype=np.float64)
+    c_a = float(env_cfg["c_A"])
+    fin_f = float(env_cfg["fin_f"])
+    fish_radius = float(env_cfg["fish_radius"])
+    ref_min = np.asarray(env_cfg["ref_min"], dtype=np.float64)
+    ref_max = np.asarray(env_cfg["ref_max"], dtype=np.float64)
+    fish_params = {key: float(value) for key, value in env_cfg["controller_params"].items()}
+    if controller_params_override:
+        for key, value in controller_params_override.items():
+            fish_params[key] = float(value)
+
+    local_planner = MPCLocalPlanner(config=env_cfg)
+
+    curr_pos = fs["p"].copy()
+    robot_vel = fs["v"].copy()
+    mode = "GLOBAL_TRACKING"
+    current_path_idx = 1
+    path_hist = [curr_pos.copy()]
+    for obstacle in dyn_obs:
+        _update_dynamic_obstacle(obstacle, 0.0)
+    dyn_obs_hist = [np.asarray([obs["c"].copy() for obs in dyn_obs], dtype=np.float64)]
+    blocked_pts_hist: list[np.ndarray] = [np.zeros((0, 3), dtype=np.float64)]
+    los_target_hist = [np.full(3, np.nan, dtype=np.float64)]
+    local_target_hist = [np.full(3, np.nan, dtype=np.float64)]
+    title_hist = ["Starting Simulation with LOS Guidance..."]
+    danger_dist_hist = [np.nan]
+    reached_goal = False
+    collided = False
+    numerical_issue = False
+    collision_info: dict | None = None
+    goal_threshold = cfg.goal_threshold
+
+    sa_settings["cmd_vel_des"] = np.zeros((3, cfg.max_steps), dtype=np.float64)
+    sa_settings["vel_act"] = np.zeros((3, cfg.max_steps), dtype=np.float64)
+    sa_settings["theta_ref"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["theta_act"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["e_theta"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["theta_int"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["psi_ref"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["psi_act"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["e_psi"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["psi_int"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["alpha5_ref"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["delta_ref"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+    sa_settings["mode"] = []
+    sa_settings["local_planner_success"] = []
+    sa_settings["local_decision_time_ms"] = np.full(cfg.max_steps, np.nan, dtype=np.float64)
+
+    for k in range(1, cfg.max_steps + 1):
+        t_k = (k - 1) * cfg.dt
+        for obstacle in dyn_obs:
+            _update_dynamic_obstacle(obstacle, t_k + cfg.dt)
+            obstacle["c"] = np.clip(obstacle["c"], scene_min + obstacle["r"], scene_max - obstacle["r"])
+
+        all_true_obs = static_obs + dyn_obs
+        safe_zone = get_visible_obstacles(curr_pos, robot_vel, all_true_obs, sensor_params)
+        end_pts = safe_zone["origin"].reshape(3, 1) + safe_zone["rays"] * safe_zone["dists"].reshape(1, -1)
+        blocked_pts = end_pts[:, safe_zone["is_blocked"]].T.copy()
+
+        visible_obs: list[dict] = []
+        for obstacle in all_true_obs:
+            for ray_idx in range(safe_zone["rays"].shape[1]):
+                if not safe_zone["is_blocked"][ray_idx]:
+                    continue
+                hit_pt = safe_zone["origin"] + safe_zone["rays"][:, ray_idx] * safe_zone["dists"][ray_idx]
+                if abs(np.linalg.norm(hit_pt - obstacle["c"]) - obstacle["r"]) < 0.1:
+                    visible_obs.append(obstacle)
+                    break
+
+        d_min = np.inf
+        if visible_obs:
+            for obstacle in visible_obs:
+                d_min = min(d_min, np.linalg.norm(curr_pos - obstacle["c"]) - obstacle["r"])
+        elif np.any(safe_zone["is_blocked"]):
+            d_min = float(np.min(safe_zone["dists"][safe_zone["is_blocked"]]))
+
+        enter_danger = np.isfinite(d_min) and d_min < sensor_params["danger_distance_enter"]
+        exit_danger = np.isfinite(d_min) and d_min < sensor_params["danger_distance_exit"]
+        if mode == "GLOBAL_TRACKING" and enter_danger:
+            mode = "LOCAL_AVOIDANCE"
+            local_planner.reset()
+        elif mode == "LOCAL_AVOIDANCE" and not exit_danger:
+            mode = "GLOBAL_TRACKING"
+
+        sa_settings["mode"].append(mode)
+        cmd_speed = _command_speed(cfg, t_k)
+        los_target = np.full(3, np.nan, dtype=np.float64)
+        local_target_log = np.full(3, np.nan, dtype=np.float64)
+        controller_snapshot: dict | None = None
+        local_success = True
+
+        if mode == "LOCAL_AVOIDANCE":
+            local_target = find_local_target(traj_global, curr_pos, cfg.local_lookahead)
+            local_target_log = np.asarray(local_target, dtype=np.float64).copy()
+            decision_tic = perf_counter()
+            attitude_ref, cmd_speed_ref, planner_info = local_planner.plan(
+                fish_state,
+                hist,
+                local_target,
+                visible_obs,
+                cmd_speed,
+            )
+            sa_settings["local_decision_time_ms"][k - 1] = (perf_counter() - decision_tic) * 1000.0
+            psi_ref = float(attitude_ref[0])
+            theta_ref = float(attitude_ref[1])
+            a1_ref, a2_ref, a3_ref, a4_ref, alpha5_ref, ctrl_state = fin_controller(
+                psi_ref,
+                theta_ref,
+                cmd_speed_ref,
+                fish_state,
+                ctrl_state,
+                cfg.dt,
+                fish_params,
+            )
+            action_ref = np.array([a1_ref, a2_ref, a3_ref, a4_ref, alpha5_ref], dtype=np.float64)
+            controller_snapshot = ctrl_state
+            cmd_vel_global = np.asarray(planner_info["cmd_vel_global"], dtype=np.float64)
+            sa_settings["cmd_vel_des"][:, k - 1] = cmd_vel_global
+            local_success = bool(planner_info.get("success", True))
+            title_hist.append(
+                f"Step {k}: LOCAL AVOIDANCE (MPC)"
+                f"{'' if not np.isfinite(d_min) else f' - Visible Dist: {d_min:.2f}'}"
+            )
+        else:
+            lookback = max(1, current_path_idx - cfg.lookback_margin)
+            _, _, psi_ref, theta_ref = los_guidance_3d(
+                curr_pos,
+                (lookback, s_max),
+                los_params["Delta"],
+                los_params["Delta"],
+                fx,
+                fy,
+                fz,
+            )
+            dists = np.sqrt(np.sum((traj_global["xyz"] - curr_pos.reshape(1, 3)) ** 2, axis=1))
+            proj_idx = int(np.argmin(dists))
+            current_path_idx = max(current_path_idx, proj_idx + 1)
+            nearest_p = traj_global["xyz"][proj_idx]
+
+            cmd_vel_global = np.array(
+                [
+                    cmd_speed * np.cos(theta_ref) * np.cos(psi_ref),
+                    cmd_speed * np.cos(theta_ref) * np.sin(psi_ref),
+                    -cmd_speed * np.sin(theta_ref),
+                ],
+                dtype=np.float64,
+            )
+            sa_settings["cmd_vel_des"][:, k - 1] = cmd_vel_global
+            a1_ref, a2_ref, a3_ref, a4_ref, alpha5_ref, ctrl_state = fin_controller(
+                psi_ref,
+                theta_ref,
+                cmd_speed,
+                fish_state,
+                ctrl_state,
+                cfg.dt,
+                fish_params,
+            )
+            action_ref = np.array([a1_ref, a2_ref, a3_ref, a4_ref, alpha5_ref], dtype=np.float64)
+            controller_snapshot = ctrl_state
+            los_target = np.array(
+                [
+                    nearest_p[0] + los_params["Delta"] * np.cos(theta_ref) * np.cos(psi_ref),
+                    nearest_p[1] + los_params["Delta"] * np.cos(theta_ref) * np.sin(psi_ref),
+                    nearest_p[2] - los_params["Delta"] * np.sin(theta_ref),
+                ],
+                dtype=np.float64,
+            )
+            title_hist.append(
+                f"Step {k}: GLOBAL TRACKING (LOS) - "
+                f"{'No obstacles in FOV' if not np.isfinite(d_min) else f'Visible Dist: {d_min:.2f}'}"
+            )
+
+        sa_settings["local_planner_success"].append(local_success)
+        _append_controller_snapshot(sa_settings, k - 1, controller_snapshot)
+
+        action_ref = np.clip(action_ref, ref_min, ref_max)
+        fish_state, hist = dynamics_step(
+            fish_state,
+            body_params,
+            fin_params,
+            cfg.dt,
+            t_k,
+            action_ref,
+            hist,
+            c_a,
+            fin_f,
+        )
+        if not np.isfinite(fish_state).all():
+            numerical_issue = True
+            blocked_pts_hist.append(blocked_pts)
+            los_target_hist.append(los_target)
+            local_target_hist.append(local_target_log)
+            danger_dist_hist.append(d_min if np.isfinite(d_min) else np.nan)
+            break
+
+        curr_pos = fish_state[[PX, PY, PZ]].copy()
+        rie = _rotation_body_to_world(fish_state)
+        robot_vel = rie.T @ fish_state[[VX, VY, VZ]]
+        sa_settings["vel_act"][:, k - 1] = robot_vel
+        path_hist.append(curr_pos.copy())
+        dyn_obs_hist.append(np.asarray([obs["c"].copy() for obs in dyn_obs], dtype=np.float64))
+        blocked_pts_hist.append(blocked_pts)
+        los_target_hist.append(los_target)
+        local_target_hist.append(local_target_log)
+        danger_dist_hist.append(d_min if np.isfinite(d_min) else np.nan)
+
+        nearest_obstacle = nearest_obstacle_info(curr_pos, robot_vel, all_true_obs, fish_radius)
+        collision_clearance = float(nearest_obstacle["clearance"])
+        if collision_clearance <= 0.0:
+            collided = True
+            collision_info = {
+                "step": k,
+                "clearance": collision_clearance,
+                "position": curr_pos.copy(),
+                "obstacle_center": np.asarray(nearest_obstacle["c"], dtype=np.float64).copy(),
+                "obstacle_radius": float(nearest_obstacle["r"]),
+                "fish_radius": fish_radius,
+                "distance": float(nearest_obstacle["distance"]),
+            }
+            title_hist[-1] = f"Step {k}: COLLISION - clearance {collision_clearance:.3f} m"
+            break
+
+        if np.linalg.norm(curr_pos - fg["p"]) < goal_threshold:
+            reached_goal = True
+            break
+
+    steps_executed = len(path_hist) - 1
+    result = {
+        "path_hist": np.asarray(path_hist, dtype=np.float64),
+        "traj_global": traj_global,
+        "dyn_obs_hist": np.asarray(dyn_obs_hist, dtype=np.float64),
+        "dyn_obs_radii": np.asarray([obs["r"] for obs in dyn_obs], dtype=np.float64),
+        "blocked_pts_hist": blocked_pts_hist,
+        "los_target_hist": np.asarray(los_target_hist, dtype=np.float64),
+        "local_target_hist": np.asarray(local_target_hist, dtype=np.float64),
+        "title_hist": title_hist,
+        "danger_dist_hist": np.asarray(danger_dist_hist, dtype=np.float64),
+        "settings": sa_settings,
+        "steps_executed": steps_executed,
+        "sensor_params": sensor_params,
+        "initial_robot_vel": fs["v"].copy(),
+        "reached_goal": reached_goal,
+        "collided": collided,
+        "numerical_issue": numerical_issue,
+        "collision_info": collision_info,
+        "goal": fg["p"].copy(),
+        "final_state": fish_state,
+        "final_hist": hist,
+        "local_planner_kind": "mpc",
+    }
+    result["local_planner_timing"] = _build_local_planner_timing(sa_settings, steps_executed)
+    result["tracking_metrics"] = _compute_tracking_metrics(sa_settings, fish_params, steps_executed)
+    if visualize:
+        from simulation.visualization import plot_hybrid_result
+
+        plot_hybrid_result(result, static_obs, dyn_obs, fg["p"], save_path=animation_path, fps=animation_fps)
+    return result
+
+
+def run_hybrid_los_mpc_simulation(
+    visualize: bool = False,
+    animation_path: str | None = None,
+    animation_fps: int = 20,
+    controller_params_override: dict | None = None,
+    sim_config: HybridSimulationConfig | None = None,
+) -> dict:
+    return _run_hybrid_los_mpc_simulation(
+        visualize=visualize,
+        animation_path=animation_path,
+        animation_fps=animation_fps,
+        controller_params_override=controller_params_override,
+        sim_config=sim_config,
+    )
+
+
+def run_hybrid_los_comparison_simulation(
+    model_path=None,
+    visualize: bool = False,
+    animation_path: str | None = None,
+    animation_fps: int = 20,
+    controller_params_override: dict | None = None,
+    sim_config: HybridSimulationConfig | None = None,
+) -> dict:
+    cfg = HybridSimulationConfig() if sim_config is None else sim_config
+    rl_result = _run_hybrid_los_rl_simulation(
+        model_path=model_path,
+        visualize=False,
+        controller_params_override=controller_params_override,
+        sim_config=cfg,
+    )
+    mpc_result = _run_hybrid_los_mpc_simulation(
+        visualize=False,
+        controller_params_override=controller_params_override,
+        sim_config=cfg,
+    )
+    comparison = {"rl": rl_result, "mpc": mpc_result}
+    if visualize:
+        from simulation.visualization import plot_hybrid_comparison_result
+
+        static_obs, _ = _build_default_obstacles()
+        plot_hybrid_comparison_result(
+            rl_result,
+            mpc_result,
+            static_obs,
+            rl_result["goal"],
+            save_path=animation_path,
+            fps=animation_fps,
+        )
+    return comparison
+
+
 def main() -> None:
-    result = run_hybrid_los_rl_simulation(
+    comparison = run_hybrid_los_comparison_simulation(
         visualize=True,
-        animation_path="data_saving/hybrid_los_rl.gif",
+        animation_path="data_saving/hybrid_los_compare.gif",
         animation_fps=30,
     )
-    print("local_planner:", result["local_planner_kind"])
-    print("reached_goal:", result["reached_goal"])
-    print("collided:", result["collided"])
-    if result["collision_info"] is not None:
-        print("collision_info:", result["collision_info"])
-    print("path_len:", len(result["path_hist"]))
-    print("tracking_metrics:", result["tracking_metrics"])
+    for planner_name, result in comparison.items():
+        print("local_planner:", planner_name)
+        print("reached_goal:", result["reached_goal"])
+        print("collided:", result["collided"])
+        if result["collision_info"] is not None:
+            print("collision_info:", result["collision_info"])
+        print("path_len:", len(result["path_hist"]))
+        timing = result["local_planner_timing"]
+        print("local_decision_count:", timing["count"])
+        if timing["count"] > 0:
+            print(
+                "local_decision_time_ms:"
+                f" mean={timing['mean_ms']:.3f}, min={timing['min_ms']:.3f}, max={timing['max_ms']:.3f}"
+            )
+        print("tracking_metrics:", result["tracking_metrics"])
 
 
 if __name__ == "__main__":

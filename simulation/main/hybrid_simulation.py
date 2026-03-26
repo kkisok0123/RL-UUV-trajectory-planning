@@ -445,6 +445,11 @@ def _run_hybrid_simulation(
     mode = "GLOBAL_TRACKING"
     current_path_idx = 1
     path_hist = [curr_pos.copy()]
+    fish_state_hist = [fish_state.copy()]
+    action_ref_hist = [np.zeros(5, dtype=np.float64)]
+    fin_ref_step_hist: list[np.ndarray] = []
+    fin_hist_in_step_hist: list[np.ndarray] = []
+    step_time_hist: list[float] = []
     for obstacle in dyn_obs:
         _update_dynamic_obstacle(obstacle, 0.0)
     dyn_obs_hist = [np.asarray([obs["c"].copy() for obs in dyn_obs], dtype=np.float64)]
@@ -577,6 +582,9 @@ def _run_hybrid_simulation(
         _append_controller_snapshot(sa_settings, k - 1, controller_snapshot)
 
         action_ref = np.clip(action_ref, ref_min, ref_max)
+        fin_ref_step_hist.append(action_ref.copy())
+        fin_hist_in_step_hist.append(hist.copy())
+        step_time_hist.append(float(t_k))
         fish_state, hist = dynamics_step(fish_state, body_params, fin_params, cfg.dt, t_k, action_ref, hist, c_a, fin_f)
         if not np.isfinite(fish_state).all():
             numerical_issue = True
@@ -591,6 +599,8 @@ def _run_hybrid_simulation(
         robot_vel = rie.T @ fish_state[[VX, VY, VZ]]
         sa_settings["vel_act"][:, k - 1] = robot_vel
         path_hist.append(curr_pos.copy())
+        fish_state_hist.append(fish_state.copy())
+        action_ref_hist.append(action_ref.copy())
         dyn_obs_hist.append(np.asarray([obs["c"].copy() for obs in dyn_obs], dtype=np.float64))
         blocked_pts_hist.append(blocked_pts)
         los_target_hist.append(los_target)
@@ -620,6 +630,11 @@ def _run_hybrid_simulation(
     steps_executed = len(path_hist) - 1
     result = {
         "path_hist": np.asarray(path_hist, dtype=np.float64),
+        "fish_state_hist": np.asarray(fish_state_hist, dtype=np.float64),
+        "action_ref_hist": np.asarray(action_ref_hist, dtype=np.float64),
+        "fin_ref_step_hist": np.asarray(fin_ref_step_hist, dtype=np.float64),
+        "fin_hist_in_step_hist": np.asarray(fin_hist_in_step_hist, dtype=np.float64),
+        "step_time_hist": np.asarray(step_time_hist, dtype=np.float64),
         "traj_global": traj_global,
         "dyn_obs_hist": np.asarray(dyn_obs_hist, dtype=np.float64),
         "dyn_obs_radii": np.asarray([obs["r"] for obs in dyn_obs], dtype=np.float64),
@@ -632,6 +647,9 @@ def _run_hybrid_simulation(
         "steps_executed": steps_executed,
         "sensor_params": sensor_params,
         "initial_robot_vel": fs["v"].copy(),
+        "sim_dt": float(cfg.dt),
+        "c_a": c_a,
+        "fin_f": fin_f,
         "reached_goal": reached_goal,
         "collided": collided,
         "numerical_issue": numerical_issue,

@@ -28,7 +28,7 @@ def main() -> None:
     """Run one demo entrypoint; switch by uncommenting the desired block below."""
     result = run_hybrid_los_rl_simulation(
         visualize=True,
-        animation_path="data_saving/hybrid_los_rl.gif",
+        animation_path=None,
         animation_fps=30,
     )
     # result = run_hybrid_los_mpc_simulation(

@@ -1,6 +1,6 @@
-"""Simulation package organized by local planner, global planner, fin controller, and main flows."""
+"""Main simulation entrypoints and visualization helpers."""
 
-from simulation.main import (
+from simulation.main.hybrid_simulation import (
     HybridSimulationConfig,
     run_hybrid_los_comparison_simulation,
     run_hybrid_los_mpc_simulation,

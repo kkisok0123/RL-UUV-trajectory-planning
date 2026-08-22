@@ -8,7 +8,6 @@ https://github.com/user-attachments/assets/8905b3e3-4f08-4281-bb09-d31432a1d9c3
 
 > 本文档对应 `adaptive-mpc` 分支。
 
-[查看演示视频](./demo.mp4)
 
 ## 主要功能
 

@@ -1,3 +1,7 @@
+
+
+https://github.com/user-attachments/assets/8905b3e3-4f08-4281-bb09-d31432a1d9c3
+
 # RL-UUV Trajectory Planning
 
 面向仿生无人水下航行器（UUV）的三维轨迹跟踪与动态避障仿真项目。系统以完整鱼体动力学为被控对象，在无障碍区域使用三维视线制导（LOS）跟踪全局参考轨迹，并在检测到障碍物后切换至 PPO 强化学习或自适应 MPC 局部规划器，最终通过鳍面控制器生成可执行控制量。

@@ -1,0 +1,390 @@
+\documentclass[UTF8,a4paper,12pt]{ctexart}
+
+\usepackage{amsmath,amssymb,bm}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\geometry{left=2.6cm,right=2.6cm,top=2.6cm,bottom=2.6cm}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  citecolor=blue!60!black,
+  urlcolor=blue!60!black
+}
+
+\lstdefinestyle{pythonstyle}{
+  language=Python,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue!60!black},
+  commentstyle=\color{green!40!black},
+  stringstyle=\color{red!50!black},
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  tabsize=4
+}
+
+\title{\textbf{基于全局路径引导与局部避障的仿生水下机器人轨迹规划技术报告}}
+\author{kkisok0123}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文围绕一个仿生水下机器人（Unmanned Underwater Vehicle, UUV）的三维轨迹规划与避障仿真项目展开，介绍系统的总体框架、动力学接口、全局路径生成、局部避障策略、强化学习训练环境、模型预测控制（Model Predictive Control, MPC）避障器以及鱼鳍控制器的实现思路。项目采用分层规划结构：上层使用全局参考路径和 LOS（Line-of-Sight）制导完成长距离路径跟踪；当传感器检测到障碍物进入危险距离时，系统切换到局部避障模式，由 PPO 强化学习策略或自适应风险 MPC 生成局部运动指令；底层鱼鳍控制器将期望姿态和速度转换为鱼鳍执行量。该结构兼顾了全局路径可解释性、局部避障实时性和动力学约束下的控制可执行性。
+\end{abstract}
+
+\textbf{关键词：} 水下机器人；轨迹规划；局部避障；强化学习；MPC；LOS 制导；鱼鳍控制
+
+\section{项目背景与目标}
+
+水下机器人在海洋巡检、目标搜索、管线维护和复杂水域探测等任务中，需要在有限感知范围、动态障碍物和水流扰动下完成安全稳定的运动。与地面机器人相比，水下机器人受三维空间运动、姿态耦合、水动力约束和执行器饱和等因素影响，轨迹规划不能只考虑几何可行性，还需要兼顾控制可实现性。
+
+本项目的目标是构建一个面向仿生鱼式 UUV 的三维轨迹规划与仿真框架，核心需求包括：
+
+\begin{itemize}
+  \item 生成从起点到终点的平滑全局参考路径；
+  \item 在无障碍或低风险场景下沿全局路径稳定跟踪；
+  \item 在检测到障碍物时切换到局部避障模式；
+  \item 支持强化学习局部规划器和 MPC 局部规划器对比；
+  \item 将规划输出映射为鱼鳍控制量，并在动力学仿真中验证。
+\end{itemize}
+
+\section{系统总体架构}
+
+项目采用分层式结构，代码组织如表~\ref{tab:modules} 所示。分层结构参考了水下航行器运动控制中“规划--制导--控制”分解的常见思想\cite{fossen2011handbook}。
+
+\begin{table}[htbp]
+\centering
+\caption{主要模块及功能}
+\label{tab:modules}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.42\linewidth}p{0.46\linewidth}}
+\toprule
+模块路径 & 功能说明 \\
+\midrule
+\path{simulation/main} & 混合仿真入口、场景构建、结果记录与可视化 \\
+\path{simulation/global_planner} & Bezier/PSO 全局路径规划与全局目标生成 \\
+\path{simulation/local_planner/rl_planner} & 基于 PPO 策略的局部避障规划器 \\
+\path{simulation/local_planner/mpc_planner} & 基于 CasADi 的自适应风险 MPC 局部规划器 \\
+\path{simulation/fin_controller} & 姿态与速度指令到鱼鳍执行量的底层控制器 \\
+\path{rl_training/envs} & Gymnasium 强化学习环境、观测构造与奖励函数 \\
+\path{rl_training/config} & 训练、传感器、扰动、奖励和控制参数配置 \\
+\path{dynamics} & 鱼体动力学接口与参数定义 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+系统运行时的主要信息流如下：
+
+\begin{enumerate}
+  \item 全局路径模块生成参考轨迹 $\bm{p}_{g}(s)$；
+  \item LOS 制导根据当前位置和路径投影点生成期望航向角 $\psi_{\mathrm{ref}}$、俯仰角 $\theta_{\mathrm{ref}}$；
+  \item 传感器模型根据视场角、探测距离和射线检测得到可见障碍物；
+  \item 若障碍物距离低于进入阈值，系统进入局部避障模式；
+  \item 局部规划器输出期望速度或姿态参考；
+  \item 鱼鳍控制器输出五维鱼鳍参考量；
+  \item 动力学模型积分得到下一时刻状态，并进入下一步仿真。
+\end{enumerate}
+
+\section{动力学与状态表示}
+
+仿真状态向量使用 13 维表示：
+\begin{equation}
+\bm{x} =
+\left[
+u, v, w,
+p, q, r,
+q_0, q_1, q_2, q_3,
+x, y, z
+\right]^\mathsf{T},
+\end{equation}
+其中 $(u,v,w)$ 为体坐标系线速度，$(p,q,r)$ 为角速度，$(q_0,q_1,q_2,q_3)$ 为姿态四元数，$(x,y,z)$ 为世界坐标系位置。
+
+动力学接口在强化学习环境和混合仿真中统一调用：
+\begin{equation}
+\bm{x}_{k+1}, \bm{h}_{k+1}
+= f_{\mathrm{dyn}}\left(
+\bm{x}_{k}, \bm{\eta}_{\mathrm{body}}, \bm{\eta}_{\mathrm{fin}},
+\Delta t, t_k, \bm{u}_{\mathrm{fin}}, \bm{h}_{k}
+\right),
+\end{equation}
+其中 $\bm{u}_{\mathrm{fin}}$ 为鱼鳍执行参考量，$\bm{h}_k$ 为鱼鳍历史状态或执行器内部状态。项目中通过 \texttt{dynamics.step} 统一封装该动力学更新过程，使强化学习训练和规划仿真使用一致的动力学后端。
+
+\section{全局路径规划与 LOS 制导}
+
+全局路径规划模块提供 Bezier 曲线与粒子群优化（Particle Swarm Optimization, PSO）结合的路径生成方法\cite{kennedy1995particle}。全局路径优化目标综合考虑速度、加速度、曲率、障碍物距离和控制点时序约束。规划器返回离散路径点：
+\begin{equation}
+\mathcal{P}_{g} = \{\bm{p}_1, \bm{p}_2, \ldots, \bm{p}_N\}.
+\end{equation}
+
+在默认混合仿真场景中，系统也提供了一条手工构造的三维参考路径，并通过 Catmull--Rom 插值生成平滑轨迹。全局跟踪阶段采用 LOS 制导，根据机器人当前位置和路径前视点生成航向角和俯仰角参考：
+\begin{equation}
+\psi_{\mathrm{ref}} = \operatorname{atan2}(y_{\mathrm{los}} - y, x_{\mathrm{los}} - x),
+\end{equation}
+\begin{equation}
+\theta_{\mathrm{ref}} =
+\operatorname{atan2}\left(
+-(z_{\mathrm{los}} - z),
+\sqrt{(x_{\mathrm{los}} - x)^2 + (y_{\mathrm{los}} - y)^2}
+\right).
+\end{equation}
+
+LOS 方法的优点是计算量小、输出平滑、便于与底层姿态控制器连接；缺点是在局部动态障碍密集时，单纯跟踪全局路径难以保证避障安全。因此系统在障碍物进入危险距离后切换到局部避障模式。
+
+\section{传感器模型与模式切换}
+
+项目使用有限视场的射线传感器模拟局部感知。传感器参数主要包括探测距离、视场角、射线数量、进入危险距离和退出危险距离。混合仿真中的典型配置为：
+
+\begin{table}[htbp]
+\centering
+\caption{混合仿真传感器参数}
+\label{tab:sensor}
+\begin{tabular}{lc}
+\toprule
+参数 & 数值 \\
+\midrule
+探测距离 & $8.0\,\mathrm{m}$ \\
+视场角 & $60^\circ$ \\
+射线数量 & $100$ \\
+进入局部避障距离 & $6.0\,\mathrm{m}$ \\
+退出局部避障距离 & $4.0\,\mathrm{m}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+模式切换逻辑可表示为：
+\begin{equation}
+\mathrm{mode}_{k+1} =
+\begin{cases}
+\mathrm{LOCAL}, & \mathrm{mode}_k=\mathrm{GLOBAL},\ d_{\min}<d_{\mathrm{enter}},\\
+\mathrm{GLOBAL}, & \mathrm{mode}_k=\mathrm{LOCAL},\ d_{\min}\ge d_{\mathrm{exit}},\\
+\mathrm{mode}_k, & \mathrm{otherwise}.
+\end{cases}
+\end{equation}
+
+其中 $d_{\min}$ 为当前可见障碍物的最小净距离。进入距离大于退出距离形成滞回区间，可以减少模式在边界附近频繁抖动。
+
+\section{强化学习局部避障规划器}
+
+\subsection{环境设计}
+
+强化学习环境基于 Gymnasium 接口实现。动作空间为三维连续速度指令：
+\begin{equation}
+\bm{a} \in [-1,1]^3,
+\end{equation}
+再根据速度上限映射到体坐标系期望速度：
+\begin{equation}
+\bm{v}_{\mathrm{cmd}}^{b} =
+\bm{a} \odot \bm{v}_{\max}^{b}.
+\end{equation}
+
+观测向量为 23 维，包含机器人线速度、角速度、目标相对位置、目标距离、最近可见障碍物相对位置、障碍物净距离、障碍物半径、相对速度以及鱼鳍历史状态。该观测设计兼顾了目标趋近、动态避障和执行器平滑性。
+
+\subsection{奖励函数}
+
+奖励函数由多个项叠加得到：
+\begin{equation}
+r =
+r_{\mathrm{progress}}
+r_{\mathrm{goal}}
+r_{\mathrm{collision}}
+r_{\mathrm{near}}
+r_{\mathrm{danger}}
+r_{\mathrm{unsafe}}
+r_{\mathrm{align}}
+r_{\mathrm{rate}}
+r_{\mathrm{smooth}}
+r_{\mathrm{energy}}
+r_{\mathrm{time}}.
+\end{equation}
+
+其中，进度奖励鼓励机器人靠近目标：
+\begin{equation}
+r_{\mathrm{progress}} = w_p(d_{k-1}-d_k),
+\end{equation}
+障碍物惩罚根据安全距离、危险距离和非安全距离分层设计，使策略在发生碰撞前就能感知风险梯度。动作平滑惩罚和能耗惩罚用于抑制高频控制和过大的鱼鳍输出。
+
+\subsection{策略部署}
+
+训练后的 PPO 模型\cite{schulman2017ppo} 保存在 \texttt{artifacts/models} 下。部署时，局部规划器读取最新或最佳模型，将当前仿真状态组装为策略观测，得到三维动作，再转换为世界系速度、姿态参考和鱼鳍执行量。模型加载时会检查观测维度是否为 23，以避免旧模型与新环境不兼容。
+
+\section{MPC 局部避障规划器}
+
+MPC 局部规划器基于 CasADi 构建非线性优化问题\cite{andersson2019casadi}。优化变量包括预测时域内的航向角参考、俯仰角参考、速度参考和位置序列：
+\begin{equation}
+\bm{u}_k = [\psi_{\mathrm{ref},k}, \theta_{\mathrm{ref},k}, v_{\mathrm{ref},k}]^\mathsf{T}.
+\end{equation}
+
+预测模型采用简化运动学形式：
+\begin{align}
+\psi_{k+1} &= \psi_k + \alpha\,\operatorname{wrap}(\psi_{\mathrm{ref},k}-\psi_k),\\
+\theta_{k+1} &= \theta_k + \alpha(\theta_{\mathrm{ref},k}-\theta_k),\\
+v_{k+1} &= v_k + \beta(v_{\mathrm{ref},k}-v_k),\\
+\bm{p}_{k+1} &= \bm{p}_k + \Delta t\,\bm{v}(\psi_{k+1},\theta_{k+1},v_{k+1}).
+\end{align}
+
+代价函数主要由目标趋近项、终端目标项、障碍物风险项、碰撞惩罚项和速度偏差项构成：
+\begin{equation}
+J =
+\sum_{k=1}^{N}
+\left(
+w_g\|\bm{p}_k-\bm{p}_{\mathrm{goal}}\|^2
++ J_{\mathrm{obs},k}
++ w_v(v_{\mathrm{ref},k}-v_{\mathrm{des},k})^2
+\right)
++ w_T\|\bm{p}_N-\bm{p}_{\mathrm{goal}}\|^2.
+\end{equation}
+
+为了处理动态障碍物，规划器记录障碍物历史速度并估计加速度，预测障碍物未来位置：
+\begin{equation}
+\bm{o}_{k} =
+\bm{o}_{0} + \bm{v}_{o}t_k + \frac{1}{2}\bm{a}_{o}t_k^2.
+\end{equation}
+
+风险值由净距离、闭合速度、闭合加速度和障碍物尺寸共同决定：
+\begin{equation}
+\rho =
+\operatorname{clip}\left(
+w_c \rho_c + w_s \rho_s + w_a \rho_a + w_r \rho_r,
+0,1
+\right).
+\end{equation}
+当风险增大时，MPC 自适应放大避障距离、碰撞距离和障碍物代价权重，并降低期望速度，从而在动态障碍靠近时生成更保守的避障轨迹。
+
+\section{鱼鳍控制器}
+
+局部或全局规划器输出的是期望速度或姿态参考，而动力学模型需要鱼鳍执行参考。控制器首先将期望速度转换为航向角、俯仰角和速度参考：
+\begin{equation}
+\psi_{\mathrm{ref}} = \operatorname{atan2}(v_y, v_x), \qquad
+\theta_{\mathrm{ref}} = \operatorname{atan2}(-v_z, \sqrt{v_x^2+v_y^2}).
+\end{equation}
+
+随后分别对俯仰误差和航向误差使用 PID 型控制律。俯仰误差控制尾鳍偏角 $\alpha_5$：
+\begin{equation}
+\alpha_{5,\mathrm{ref}} =
+K_{p,z}e_\theta + K_{i,z}\int e_\theta\,dt + K_{d,z}\dot{e}_\theta.
+\end{equation}
+
+航向误差控制左右鱼鳍幅值差：
+\begin{equation}
+\delta_{\mathrm{ref}} =
+K_{p,\psi}e_\psi + K_{i,\psi}\int e_\psi\,dt + K_{d,\psi}\dot{e}_\psi.
+\end{equation}
+
+推进鱼鳍幅值根据期望速度平滑调度，避免从低速到高速时控制量突变。最终输出五维执行量：
+\begin{equation}
+\bm{u}_{\mathrm{fin}} =
+[a_1, a_2, a_3, a_4, \alpha_5]^\mathsf{T}.
+\end{equation}
+
+\section{实验方案}
+
+建议从以下三个实验维度组织结果。
+
+\subsection{全局跟踪实验}
+
+在无障碍或远离障碍物的场景中，仅启用全局路径与 LOS 制导，验证机器人能否稳定跟踪三维路径。建议记录：
+\begin{itemize}
+  \item 最终是否到达目标；
+  \item 轨迹长度；
+  \item 航向角和俯仰角跟踪 RMSE；
+  \item 鱼鳍执行器饱和比例。
+\end{itemize}
+
+\subsection{局部避障实验}
+
+在静态障碍和动态障碍混合场景中分别运行 RL 和 MPC 局部规划器。建议比较：
+\begin{itemize}
+  \item 是否发生碰撞；
+  \item 最小障碍物净距离；
+  \item 局部规划调用次数；
+  \item 平均单次局部规划耗时；
+  \item 到达目标所需步数。
+\end{itemize}
+
+\subsection{RL 与 MPC 对比实验}
+
+项目已经提供 \texttt{run\_hybrid\_los\_comparison\_simulation} 接口，可在相同场景下比较 RL 和 MPC。建议将结果整理为表~\ref{tab:compare-template}。
+
+\begin{table}[htbp]
+\centering
+\caption{RL 与 MPC 局部规划器对比结果模板}
+\label{tab:compare-template}
+\begin{tabular}{lcc}
+\toprule
+指标 & RL 局部规划器 & MPC 局部规划器 \\
+\midrule
+是否到达目标 & 待填写 & 待填写 \\
+是否碰撞 & 待填写 & 待填写 \\
+仿真步数 & 待填写 & 待填写 \\
+最小净距离 / m & 待填写 & 待填写 \\
+局部规划调用次数 & 待填写 & 待填写 \\
+平均局部规划耗时 / ms & 待填写 & 待填写 \\
+航向角 RMSE / deg & 待填写 & 待填写 \\
+俯仰角 RMSE / deg & 待填写 & 待填写 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{运行方式}
+
+混合仿真的入口位于 \texttt{simulation/main/main.py}。默认示例运行 RL 局部规划器并导出动画：
+
+\begin{lstlisting}[style=pythonstyle]
+result = run_hybrid_los_rl_simulation(
+    visualize=True,
+    animation_path="data_saving/hybrid_los_rl.gif",
+    animation_fps=30,
+)
+\end{lstlisting}
+
+若需要切换为 MPC 或 RL/MPC 对比，可在同一文件中切换对应函数：
+
+\begin{lstlisting}[style=pythonstyle]
+result = run_hybrid_los_mpc_simulation(
+    visualize=True,
+    animation_path="data_saving/hybrid_los_mpc.gif",
+    animation_fps=30,
+)
+
+result = run_hybrid_los_comparison_simulation(
+    visualize=True,
+    animation_path="data_saving/hybrid_los_compare.gif",
+    animation_fps=30,
+)
+\end{lstlisting}
+
+\section{当前实现的特点与不足}
+
+当前实现具有以下特点：
+\begin{itemize}
+  \item 使用统一动力学接口连接训练、规划和仿真；
+  \item 通过全局 LOS 与局部避障切换兼顾效率和安全性；
+  \item RL 策略可直接输出速度指令，适合快速在线决策；
+  \item MPC 显式考虑动态障碍预测和风险自适应权重，解释性较强；
+  \item 控制层记录姿态误差、积分项和执行器饱和信息，便于后续分析。
+\end{itemize}
+
+仍需改进的方向包括：
+\begin{itemize}
+  \item 当前全局路径与局部避障之间主要通过局部目标点连接，后续可加入更严格的路径重规划机制；
+  \item RL 策略的泛化能力需要通过更多随机场景、传感器噪声和水流扰动验证；
+  \item MPC 的实时性受 CasADi/IPOPT 求解速度影响，复杂障碍场景下需要进一步优化求解时间；
+  \item 技术报告中的定量实验表格需要用批量仿真结果补充。
+\end{itemize}
+
+\section{结论}
+
+本文整理了一个仿生水下机器人轨迹规划项目的核心技术路线。系统采用全局路径引导、局部避障规划和底层鱼鳍控制的分层结构，能够在三维动态障碍环境中完成路径跟踪与避障仿真。强化学习局部规划器强调快速决策和经验策略，MPC 局部规划器强调约束处理和风险可解释性，两者可在同一仿真框架中进行对比。后续工作可围绕批量实验评估、真实参数标定、全局重规划和控制器鲁棒性进一步展开。
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

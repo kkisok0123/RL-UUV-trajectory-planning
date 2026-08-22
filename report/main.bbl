@@ -1,0 +1,23 @@
+\begin{thebibliography}{1}
+
+\bibitem{andersson2019casadi}
+Joel A.~E. Andersson, Joris Gillis, Greg Horn, James~B. Rawlings, and Moritz Diehl.
+\newblock Casadi: A software framework for nonlinear optimization and optimal control.
+\newblock {\em Mathematical Programming Computation}, 11:1--36, 2019.
+
+\bibitem{fossen2011handbook}
+Thor~I. Fossen.
+\newblock {\em Handbook of Marine Craft Hydrodynamics and Motion Control}.
+\newblock Wiley, 2011.
+
+\bibitem{kennedy1995particle}
+James Kennedy and Russell Eberhart.
+\newblock Particle swarm optimization.
+\newblock {\em Proceedings of ICNN'95 - International Conference on Neural Networks}, 1995.
+
+\bibitem{schulman2017ppo}
+John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov.
+\newblock Proximal policy optimization algorithms.
+\newblock {\em arXiv preprint arXiv:1707.06347}, 2017.
+
+\end{thebibliography}
